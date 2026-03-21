@@ -31,8 +31,27 @@ const originalLines = content.split('\n').length;
 console.log(`📄 Processing file: ${filePath}`);
 console.log(`📊 Original file size: ${originalLength} characters, ${originalLines} lines`);
 
-// Count all console statements before removal (log, error, warn, debug)
-const consoleLogPattern = /console\.(log|error|warn|debug)\([^)]*\);?/g;
+// Normalize various console patterns so we can handle "all kinds" of console calls
+// Examples this normalizes:
+// - window.console.log(...)      -> console.log(...)
+// - console   .   log(...)       -> console.log(...)
+// - console?.log(...)            -> console.log(...)
+// - window.console   ?.  log(...) -> console.log(...)
+content = content
+  // window.console.* -> console.*
+  .replace(/window\.console\s*\?\.\s*/g, 'console.')
+  .replace(/window\.console\s*\.\s*/g, 'console.')
+  // console?.method -> console.method
+  .replace(/console\s*\?\.\s*/g, 'console.')
+  // console   .   method -> console.method
+  .replace(/console\s*\.\s*/g, 'console.');
+
+// Count all console statements before removal (after normalization)
+// This is intentionally broad so we catch:
+// - console.log / console.error / console.warn / console.debug
+// - console.trace / console.info / console.dir / console.table / etc.
+// - Any other custom console methods
+const consoleLogPattern = /console\.[a-zA-Z_$][a-zA-Z0-9_$]*\([^)]*\);?/g;
 const matches = content.match(consoleLogPattern);
 const countBefore = matches ? matches.length : 0;
 
@@ -51,16 +70,8 @@ let result = '';
 let i = 0;
 
 while (i < content.length) {
-  // Look for "console.log(", "console.error(", "console.warn(", or "console.debug("
-  const consoleLogIndex = content.indexOf('console.log(', i);
-  const consoleErrorIndex = content.indexOf('console.error(', i);
-  const consoleWarnIndex = content.indexOf('console.warn(', i);
-  const consoleDebugIndex = content.indexOf('console.debug(', i);
-  
-  // Find the earliest occurrence
-  const indices = [consoleLogIndex, consoleErrorIndex, consoleWarnIndex, consoleDebugIndex]
-    .filter(idx => idx !== -1);
-  const consoleIndex = indices.length > 0 ? Math.min(...indices) : -1;
+  // Look for the next "console." and handle ANY console method
+  const consoleIndex = content.indexOf('console.', i);
   
   if (consoleIndex === -1) {
     // No more console statements, add remaining content
@@ -68,30 +79,23 @@ while (i < content.length) {
     break;
   }
   
-  // Determine which console method we found
-  let consoleMethod = '';
-  let consoleMethodLength = 0;
-  if (consoleIndex === consoleLogIndex) {
-    consoleMethod = 'console.log(';
-    consoleMethodLength = 'console.log('.length;
-  } else if (consoleIndex === consoleErrorIndex) {
-    consoleMethod = 'console.error(';
-    consoleMethodLength = 'console.error('.length;
-  } else if (consoleIndex === consoleWarnIndex) {
-    consoleMethod = 'console.warn(';
-    consoleMethodLength = 'console.warn('.length;
-  } else if (consoleIndex === consoleDebugIndex) {
-    consoleMethod = 'console.debug(';
-    consoleMethodLength = 'console.debug('.length;
+  // Determine where the opening parenthesis for this console call is.
+  // We assume standard calls like "console.xyz(...)" and find the first "(" after "console."
+  const openParenIndex = content.indexOf('(', consoleIndex);
+  if (openParenIndex === -1) {
+    // Malformed / unexpected, just move past "console." to avoid infinite loop
+    result += content.substring(i, consoleIndex + 'console.'.length);
+    i = consoleIndex + 'console.'.length;
+    continue;
   }
   
   // Add content before the console statement
   result += content.substring(i, consoleIndex);
   
   // Find the matching closing parenthesis
-  // console.xxx( already has an opening paren, so we start with depth = 1
+  // We already have an opening "(", so start with depth = 1
   let depth = 1;
-  let j = consoleIndex + consoleMethodLength;
+  let j = openParenIndex + 1;
   
   // Track parentheses to find the matching closing
   while (j < content.length) {

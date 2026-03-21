@@ -90,6 +90,20 @@
     // Customer data (starts empty, customers added through admin interface)
     let customers = [];
 
+    // Resolved after first dashboard data load so Send Bill never opens with an empty customer list
+    window.__billModuleCustomersReady = new Promise((resolve) => {
+      window.__resolveBillModuleCustomersReady = resolve;
+    });
+    function resolveBillModuleCustomersReadyGate() {
+      if (typeof window.__resolveBillModuleCustomersReady === 'function') {
+        try {
+          window.__resolveBillModuleCustomersReady();
+        } finally {
+          window.__resolveBillModuleCustomersReady = null;
+        }
+      }
+    }
+
     // Drawers data (starts empty, drawers added through settings)
     let drawers = [];
 
@@ -109,7 +123,13 @@
     let sewerCharge = 170;
 
     // Late fee setting (defaults to 20, loaded from Firebase)
+    // lateFeeMode: 'flat' = dollars per 30-day cycle (× cycles, max 3); 'percent' = % of amount due before late fees (× cycles).
     let lateFee = 20;
+    let lateFeeMode = 'flat';
+
+    // Toggle: automatically apply late fees based on days late (30/60/90 cycles)
+    // Defaults to true; stored in settings/toggles as autoApplyLateFees
+    let autoApplyLateFees = true;
 
     // PUC Surcharge setting (defaults to 0, loaded from Firebase, applied as percentage to all customers)
     let pucSurcharge = 0;
@@ -435,7 +455,7 @@
     // Save all customers to Firestore (used for imports - replaces all customers)
     async function saveAllCustomersToFirestore(progressCallback) {
       try {
-        
+
         const customersRef = collection(db, 'customers');
 
         // Clear existing customers first (only for full imports) - use batches for deletion too
@@ -469,7 +489,7 @@
         for (let i = 0; i < customers.length; i += batchSize) {
           const batch = writeBatch(db);
           const batchCustomers = customers.slice(i, Math.min(i + batchSize, customers.length));
-          
+
           batchCustomers.forEach(customer => {
             const customerRef = doc(customersRef, customer.id);
             batch.set(customerRef, customer);
@@ -494,7 +514,7 @@
             await new Promise(resolve => setTimeout(resolve, 100));
           }
         }
-        
+
       } catch (error) {
 
         throw error; // Re-throw to be caught by caller
@@ -504,17 +524,17 @@
     // Save/update customers to Firestore (used for regular updates - updates existing customers)
     async function saveCustomersToFirestore(progressCallback) {
       try {
-        
+
         const customersRef = collection(db, 'customers');
         const totalCustomers = customers.length;
         const batchSize = 500; // Firestore batch limit
         let savedCount = 0;
-        
+
         // Use batch writes to reduce API calls
         for (let i = 0; i < customers.length; i += batchSize) {
           const batch = writeBatch(db);
           const batchCustomers = customers.slice(i, Math.min(i + batchSize, customers.length));
-          
+
           batchCustomers.forEach(customer => {
             try {
               const customerRef = doc(customersRef, customer.id);
@@ -543,7 +563,7 @@
             await new Promise(resolve => setTimeout(resolve, 100));
           }
         }
-        
+
       } catch (error) {
 
         throw error; // Re-throw to be caught by caller
@@ -993,10 +1013,12 @@
         if (settingsDoc.exists()) {
           const data = settingsDoc.data();
           lateFee = data.value !== undefined ? data.value : 20;
+          lateFeeMode = data.mode === 'percent' ? 'percent' : 'flat';
         } else {
           // If setting doesn't exist, create it with default value
-          await setDoc(settingsRef, { value: 20 });
+          await setDoc(settingsRef, { value: 20, mode: 'flat' });
           lateFee = 20;
+          lateFeeMode = 'flat';
         }
 
         // Update UI if Codes screen is visible
@@ -1005,6 +1027,7 @@
 
         // Keep default value on error
         lateFee = 20;
+        lateFeeMode = 'flat';
       }
     }
 
@@ -1012,7 +1035,7 @@
     async function saveLateFeeToFirestore() {
       try {
         const settingsRef = doc(db, 'settings', 'lateFee');
-        await setDoc(settingsRef, { value: lateFee });
+        await setDoc(settingsRef, { value: lateFee, mode: lateFeeMode });
       } catch (error) {
 
         throw error;
@@ -1071,6 +1094,9 @@
             afterHoursEndTime: data.afterHoursEndTime || '09:00',
             posDoesntCloseOut: data.posDoesntCloseOut || false,
             useUsernameInsteadOfUserCode: data.useUsernameInsteadOfUserCode || false,
+            autoApplyLateFees: (data.autoApplyLateFees === undefined || data.autoApplyLateFees === null)
+              ? true
+              : !!data.autoApplyLateFees,
             testDate: data.testDate || null
           };
 
@@ -1083,6 +1109,9 @@
             }
             updateTestDateDisplay();
           }
+          // Keep global toggle in sync
+          autoApplyLateFees = settings.autoApplyLateFees;
+
         } else {
           // If setting doesn't exist, create it with default values
           settings = { 
@@ -1092,9 +1121,11 @@
             afterHoursStartTime: '17:00',
             afterHoursEndTime: '09:00',
             posDoesntCloseOut: false,
-            useUsernameInsteadOfUserCode: false
+            useUsernameInsteadOfUserCode: false,
+            autoApplyLateFees: true
           };
           await setDoc(settingsRef, settings);
+          autoApplyLateFees = true;
         }
 
         // Update checkboxes if they exist
@@ -1128,6 +1159,7 @@
           posDoesntCloseOutCheckbox.checked = settings.posDoesntCloseOut;
         }
         const useUsernameInsteadOfUserCodeCheckbox = document.getElementById('toggleUseUsernameInsteadOfUserCode');
+        const autoApplyLateFeesCheckbox = document.getElementById('toggleAutoApplyLateFees');
         if (useUsernameInsteadOfUserCodeCheckbox) {
           const toggleValue = settings.useUsernameInsteadOfUserCode === true || settings.useUsernameInsteadOfUserCode === 'true' || settings.useUsernameInsteadOfUserCode === 1;
           useUsernameInsteadOfUserCodeCheckbox.checked = toggleValue;
@@ -1165,6 +1197,7 @@
         const afterHoursEndTimeInput = document.getElementById('afterHoursEndTime');
         const posDoesntCloseOutCheckbox = document.getElementById('togglePOSDoesntCloseOut');
         const useUsernameInsteadOfUserCodeCheckbox = document.getElementById('toggleUseUsernameInsteadOfUserCode');
+        const autoApplyLateFeesCheckbox = document.getElementById('toggleAutoApplyLateFees');
 
         const askUserCodePerTransaction = toggleCheckbox ? toggleCheckbox.checked : false;
         const skipPOSInitialRegisterCount = skipInitialCountCheckbox ? skipInitialCountCheckbox.checked : false;
@@ -1173,6 +1206,7 @@
         const afterHoursEndTime = afterHoursEndTimeInput ? afterHoursEndTimeInput.value : '09:00';
         const posDoesntCloseOut = posDoesntCloseOutCheckbox ? posDoesntCloseOutCheckbox.checked : false;
         const useUsernameInsteadOfUserCode = useUsernameInsteadOfUserCodeCheckbox ? useUsernameInsteadOfUserCodeCheckbox.checked : false;
+        const autoApplyLateFeesLocal = autoApplyLateFeesCheckbox ? autoApplyLateFeesCheckbox.checked : true;
 
         const settingsRef = doc(db, 'settings', 'toggles');
         const settingsToSave = {
@@ -1183,8 +1217,11 @@
           afterHoursEndTime: afterHoursEndTime,
           posDoesntCloseOut: posDoesntCloseOut,
           useUsernameInsteadOfUserCode: useUsernameInsteadOfUserCode,
+          autoApplyLateFees: autoApplyLateFeesLocal,
           updatedAt: new Date().toISOString()
         };
+
+        autoApplyLateFees = autoApplyLateFeesLocal;
 
         await setDoc(settingsRef, settingsToSave);
 
@@ -1426,66 +1463,94 @@
 
     // Get current date (either real or test date)
     window.getCurrentDate = function() {
+
       if (testDate) {
-        return new Date(testDate);
+        // Parse testDate as a LOCAL calendar date, not UTC, to avoid off‑by‑one issues
+        let d;
+        if (typeof testDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(testDate)) {
+          const [y, m, day] = testDate.split('-').map(Number);
+          d = new Date(y, m - 1, day); // local midnight
+        } else {
+          d = new Date(testDate);
+        }
+
+        return d;
       }
-      return new Date();
+      const realNow = new Date();
+
+      return realNow;
     };
 
     // Set test date (called from Data Cleanup input)
     window.setTestDate = async function(dateString) {
+
       if (dateString && dateString.trim() !== '') {
         const parsed = new Date(dateString);
         if (!isNaN(parsed.getTime())) {
+
           testDate = dateString;
 
           // Save to Firestore settings
           try {
+
             const settingsRef = doc(db, 'settings', 'toggles');
             await updateDoc(settingsRef, { testDate: dateString });
+
           } catch (error) {
 
           }
 
           updateTestDateDisplay();
           // Refresh UI to reflect new date
+
           updateDashboard();
           if (document.getElementById('settingsModule') && !document.getElementById('settingsModule').classList.contains('hidden')) {
+
             updateSettingsCustomerTable();
           }
         } else {
           alert('Invalid date format. Please use YYYY-MM-DD format.');
+
         }
       } else {
+
         testDate = null;
 
         // Save null to Firestore settings
         try {
+
           const settingsRef = doc(db, 'settings', 'toggles');
           await updateDoc(settingsRef, { testDate: null });
+
         } catch (error) {
 
         }
 
         updateTestDateDisplay();
         // Refresh UI
+
         updateDashboard();
         if (document.getElementById('settingsModule') && !document.getElementById('settingsModule').classList.contains('hidden')) {
+
           updateSettingsCustomerTable();
         }
       }
+
     };
 
     // Clear test date
     window.clearTestDate = async function() {
+
       testDate = null;
       const input = document.getElementById('testDateInput');
       if (input) {
         input.value = '';
+
       }
 
       // Save null to Firestore settings
       try {
+
         const settingsRef = doc(db, 'settings', 'toggles');
         await updateDoc(settingsRef, { testDate: null });
       } catch (error) {
@@ -1495,29 +1560,37 @@
       updateTestDateDisplay();
 
       // Refresh UI
+
       updateDashboard();
       if (document.getElementById('settingsModule') && !document.getElementById('settingsModule').classList.contains('hidden')) {
+
         updateSettingsCustomerTable();
       }
+
     };
 
     // Update test date display
     function updateTestDateDisplay() {
       const statusEl = document.getElementById('testDateStatus');
-      const displayEl = document.getElementById('currentDateDisplay');
-      if (statusEl && displayEl) {
-        const current = window.getCurrentDate();
-        const dateStr = current.toLocaleDateString('en-US', { 
-          weekday: 'long', 
-          year: 'numeric', 
-          month: 'long', 
-          day: 'numeric' 
-        });
-        if (testDate) {
-          statusEl.innerHTML = `Using test date: <strong>${dateStr}</strong>`;
-        } else {
-          statusEl.innerHTML = `Using real current date: <strong>${dateStr}</strong>`;
-        }
+      if (!statusEl) {
+
+        return;
+      }
+
+      const current = window.getCurrentDate();
+
+      const dateStr = current.toLocaleDateString('en-US', { 
+        weekday: 'long', 
+        year: 'numeric', 
+        month: 'long', 
+        day: 'numeric' 
+      });
+      if (testDate) {
+        statusEl.innerHTML = `Using test date: <strong>${dateStr}</strong>`;
+
+      } else {
+        statusEl.innerHTML = `Using real current date: <strong>${dateStr}</strong>`;
+
       }
     }
 
@@ -1554,12 +1627,12 @@
         // Check if we've already reset this month by checking if there's a reset flag in localStorage
         const lastResetDate = localStorage.getItem('lastMonthlyBillReset');
         const currentMonthKey = `${now.getFullYear()}-${now.getMonth()}`;
-        
+
         // Only reset if we haven't reset this month yet
         if (lastResetDate !== currentMonthKey) {
 
           let needsSave = false;
-          
+
           customers.forEach(customer => {
             // Only reset if currentBill is not already equal to sewer charge (avoid unnecessary saves)
             if (customer.currentBill !== sewerCharge) {
@@ -2195,7 +2268,8 @@
           if (logoutBtn) logoutBtn.classList.remove('hidden');
         } else if (userRole === 'admin' || userRole === 'helpdesk') {
 
-          // Admin and Help Desk users: All buttons (default behavior)
+          // Admin and Help Desk users: standard navigation actions ONLY
+          // They should NEVER see Start Of Day Drawer Count or Close Out Drawer buttons.
           if (addClientBtn) {
             addClientBtn.classList.remove('hidden');
 
@@ -2212,10 +2286,11 @@
             searchDatabaseBtn.classList.remove('hidden');
 
           }
+          // Ensure drawer-related buttons are always hidden for admin/helpdesk
           if (drawerCountBtn) {
-            drawerCountBtn.classList.remove('hidden');
+            drawerCountBtn.classList.add('hidden');
           }
-          // Admin users do NOT get Close Out Drawer button
+          // Admin/helpdesk users do NOT get Close Out Drawer button
           if (closeOutDrawerBtn) {
             closeOutDrawerBtn.classList.add('hidden');
           }
@@ -2237,9 +2312,9 @@
           }
         }
       }
-      
+
       const currentUser = await window.firebaseAuth.waitForAuth();
-      
+
       // Function to show Firebase Auth modal
       function showFirebaseAuthModal() {
         const modal = document.getElementById('firebaseAuthModal');
@@ -2248,7 +2323,7 @@
           document.getElementById('firebaseEmail').focus();
         }
       }
-      
+
       // Function to hide Firebase Auth modal
       function hideFirebaseAuthModal() {
         const modal = document.getElementById('firebaseAuthModal');
@@ -2256,7 +2331,7 @@
           modal.classList.add('hidden');
         }
       }
-      
+
       // Make it globally accessible
       window.hideFirebaseAuthModal = hideFirebaseAuthModal;
 
@@ -2312,7 +2387,7 @@
           showFirebaseAuthModal();
           return false;
         }
-        
+
         // Check after hours restriction for POS users (even if already authenticated)
 
         if (userRole === 'pos') {
@@ -2430,7 +2505,7 @@
 
         return true;
       }
-      
+
       // Set up Firebase Auth form handler
       const firebaseAuthForm = document.getElementById('firebaseAuthForm');
       if (firebaseAuthForm) {
@@ -2443,11 +2518,11 @@
           const userCode = document.getElementById('firebasePassword').value.trim();
           const errorDiv = document.getElementById('firebaseAuthError');
           const submitBtn = document.getElementById('firebaseAuthSubmit');
-          
+
           errorDiv.classList.add('hidden');
           submitBtn.disabled = true;
           submitBtn.textContent = 'Signing in...';
-          
+
           try {
             // Ensure users are loaded
 
@@ -2591,7 +2666,7 @@
       } else {
 
       }
-      
+
       // Check authentication status
 
       // Load users FIRST (before auth check) so login can work
@@ -2623,6 +2698,7 @@
       if (!authResult) {
 
         // Don't load data if not authenticated
+        resolveBillModuleCustomersReadyGate();
         return;
       }
 
@@ -2642,57 +2718,63 @@
 
       }
 
-      // CRITICAL: Load codes FIRST before customers!
-      // This ensures that when populateCustomerCodesFromImportData() runs during customer load,
-      // it will find existing codes in the array instead of creating new ones with default values
+      try {
+        // CRITICAL: Load codes FIRST before customers!
+        // This ensures that when populateCustomerCodesFromImportData() runs during customer load,
+        // it will find existing codes in the array instead of creating new ones with default values
 
-      await loadCodesFromFirestore();
+        await loadCodesFromFirestore();
 
-      await loadSewerChargeFromFirestore();
-      await loadLateFeeFromFirestore();
-      await loadPucSurchargeFromFirestore();
-      await loadHierarchyOrder();
+        await loadSewerChargeFromFirestore();
+        await loadLateFeeFromFirestore();
+        await loadPucSurchargeFromFirestore();
+        await loadHierarchyOrder();
 
-      // Now load other data
+        // Now load other data
 
-      await loadLocationsFromFirestore();
+        await loadLocationsFromFirestore();
 
-      await loadCustomersFromFirestore();
+        await loadCustomersFromFirestore();
 
-      await loadUsersFromFirestore();
+        await loadUsersFromFirestore();
 
-      await loadDrawersFromFirestore();
+        await loadDrawersFromFirestore();
 
-      await loadPaymentProcessingSessionsFromFirestore();
+        await loadPaymentProcessingSessionsFromFirestore();
 
-      await loadTogglesSettings();
+        await loadTogglesSettings();
 
-      const buttonContainerAfter = document.querySelector('.flex.flex-col.items-center.gap-4.mb-8.p-8.max-w-2xl.mx-auto.bg-white');
+        const buttonContainerAfter = document.querySelector('.flex.flex-col.items-center.gap-4.mb-8.p-8.max-w-2xl.mx-auto.bg-white');
 
-      // Check if drawer count module is visible - if so, don't show buttons
-      const drawerCountModule = document.getElementById('drawerCountModule');
-      const isDrawerCountVisible = drawerCountModule && !drawerCountModule.classList.contains('hidden');
+        // Check if drawer count module is visible - if so, don't show buttons
+        const drawerCountModule = document.getElementById('drawerCountModule');
+        const isDrawerCountVisible = drawerCountModule && !drawerCountModule.classList.contains('hidden');
 
-      // Ensure buttons are visible after data load (but not if drawer count is showing)
-      if (!isDrawerCountVisible && buttonContainerAfter && buttonContainerAfter.classList.contains('hidden')) {
+        // Ensure buttons are visible after data load (but not if drawer count is showing)
+        if (!isDrawerCountVisible && buttonContainerAfter && buttonContainerAfter.classList.contains('hidden')) {
 
-        showDashboardButtons();
-      } else if (isDrawerCountVisible) {
+          showDashboardButtons();
+        } else if (isDrawerCountVisible) {
 
-      } else if (!buttonContainerAfter) {
+        } else if (!buttonContainerAfter) {
 
-      } else {
+        } else {
 
+        }
+        // Update customer payment statuses based on past due amounts
+        updateAllCustomerPaymentStatuses();
+        // Reset bills if it's the first of the month
+        resetMonthlyBills();
+        // Update location statuses based on customers
+        updateLocationStatuses();
+        // Update stats after data is loaded
+
+        updateStats();
+      } catch (e) {
+        console.error('Dashboard data load error:', e);
+      } finally {
+        resolveBillModuleCustomersReadyGate();
       }
-      // Update customer payment statuses based on past due amounts
-      updateAllCustomerPaymentStatuses();
-      // Reset bills if it's the first of the month
-      resetMonthlyBills();
-      // Update location statuses based on customers
-      updateLocationStatuses();
-      // Update stats after data is loaded
-
-      updateStats();
     });
 
     // Switch between accounts and locations views
@@ -2861,58 +2943,313 @@
 
     }
 
-    // Get number of days a customer is overdue (for filtering by 30/60/90 days late)
-    function getCustomerDaysLate(customer) {
-      if (!customer || (parseFloat(customer.pastDue || 0) <= 0)) return 0;
-      if (typeof customer.daysLate === 'number' && !isNaN(customer.daysLate)) return Math.max(0, customer.daysLate);
-      const importData = customer.importData || {};
-      const daysFromImport = importData['Days'];
-      if (daysFromImport !== undefined && daysFromImport !== null && daysFromImport !== '') {
-        const parsed = parseInt(daysFromImport, 10);
-        if (!isNaN(parsed) && parsed >= 0) return parsed;
+    // --- Late tracking: calendar from last bill print + 20-day grace ---
+    // Owed balance can be prior pastDue OR unpaid current-cycle charges (pastDue may be $0).
+
+    function getDaysSinceLastBillPrint(customer) {
+      if (!customer || !customer.lastBillPrintDate) return null;
+      let billDate;
+      try {
+        billDate = new Date(customer.lastBillPrintDate);
+      } catch (e) {
+        return null;
       }
-      const billDateVal = importData['Bill Date'] || importData['BillDate'];
-      if (billDateVal) {
-        let billDate;
-        if (typeof billDateVal === 'number') {
-          const serial = billDateVal;
-          if (serial > 0 && serial < 1000000) {
-            const excelEpoch = new Date(1899, 11, 30);
-            billDate = new Date(excelEpoch.getTime() + (serial - 1) * 24 * 60 * 60 * 1000);
-          }
-        } else if (typeof billDateVal === 'string') {
-          const mdy = billDateVal.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
-          if (mdy) {
-            const y = parseInt(mdy[3], 10);
-            const year = y < 100 ? 2000 + y : y;
-            billDate = new Date(year, parseInt(mdy[1], 10) - 1, parseInt(mdy[2], 10));
-          }
-        }
-        if (billDate && !isNaN(billDate.getTime())) {
-          const now = window.getCurrentDate ? window.getCurrentDate() : new Date();
-          const diffMs = now.getTime() - new Date(billDate).getTime();
-          return Math.max(0, Math.floor(diffMs / (24 * 60 * 60 * 1000)));
-        }
-      }
-      return 0;
+      if (!billDate || isNaN(billDate.getTime())) return null;
+      const now = window.getCurrentDate ? window.getCurrentDate() : new Date();
+      const billY = billDate.getFullYear();
+      const billM = billDate.getMonth();
+      const billD = billDate.getDate();
+      const nowY = now.getFullYear();
+      const nowM = now.getMonth();
+      const nowD = now.getDate();
+      const billUtcMidnight = Date.UTC(billY, billM, billD);
+      const nowUtcMidnight = Date.UTC(nowY, nowM, nowD);
+      const diffMs = nowUtcMidnight - billUtcMidnight;
+      if (diffMs <= 0) return 0;
+      return Math.floor(diffMs / (24 * 60 * 60 * 1000));
     }
 
-    // Update customer payment status based on past due amount
+    /** Days past the due date (print + grace). Does not check whether they still owe. */
+    function getCalendarDaysLateAfterGrace(customer, graceDays = 20) {
+      const dsp = getDaysSinceLastBillPrint(customer);
+      if (dsp === null) return 0;
+      return Math.max(0, dsp - graceDays);
+    }
+
+    /** Number of 30-day late-fee cycles (1–3) from days past grace. */
+    function getLateFeeCycleCount(daysLate) {
+      if (!autoApplyLateFees || daysLate <= 0) return 0;
+      let cycles = 1 + Math.floor((daysLate - 1) / 30);
+      if (cycles < 0) cycles = 0;
+      if (cycles > 3) cycles = 3;
+      return cycles;
+    }
+
+    /**
+     * Amount due (current bill + past due) before late fees — used as the base for percentage late fees.
+     */
+    function getLateFeeBaseAmountBeforeFees(customer) {
+      if (!customer) return 0;
+      const { subtotalBeforePuc, pucSurchargeAmount } = getSubtotalBeforePucAndPucSurcharge(customer);
+      const pastDueRaw = parseFloat(customer.pastDue || 0);
+      const pastDue = Math.max(0, pastDueRaw);
+      const credit = Math.abs(Math.min(0, pastDueRaw));
+      const currentMonthPaid = parseFloat(customer.currentMonthPaid || 0);
+      const currentNoLate = Math.max(0, subtotalBeforePuc + pucSurchargeAmount - currentMonthPaid);
+      return Math.max(0, currentNoLate + pastDue - credit);
+    }
+
+    /**
+     * Late fee $ for a customer given calendar days late (past grace).
+     * Flat: lateFee × cycles. Percent: (base before fees) × (lateFee/100) × cycles.
+     */
+    function getLateFeeAmountForCustomerAndDaysLate(customer, calendarDaysLate) {
+      const cycles = getLateFeeCycleCount(calendarDaysLate);
+      if (cycles === 0) return 0;
+      if (lateFeeMode === 'percent') {
+        const base = getLateFeeBaseAmountBeforeFees(customer);
+        if (base <= 0) return 0;
+        return Math.round(base * (lateFee / 100) * cycles * 100) / 100;
+      }
+      return lateFee * cycles;
+    }
+
+    /** Current-cycle subtotal + PUC only (no late fee, no side effects). */
+    function getSubtotalBeforePucAndPucSurcharge(customer) {
+      const baseServiceCost = calculateProratedServiceCost(customer);
+      const factor = customer.factor ? parseFloat(customer.factor) : 1.0;
+      const adjustedServiceCost = baseServiceCost * factor;
+      let totalSurcharge = 0;
+      if (customer.codes && customer.codes.length > 0) {
+        customer.codes.forEach(customerCode => {
+          let latestCode = codes.find(c => c.id === customerCode.id);
+          if (!latestCode) {
+            latestCode = codes.find(c => c.name.toLowerCase() === customerCode.name.toLowerCase());
+          }
+          const codeToUse = latestCode || customerCode;
+          const codeType = codeToUse.type || 'percentage';
+          const codeAmount = codeToUse.amount !== undefined ? codeToUse.amount : (codeToUse.percentage !== undefined ? codeToUse.percentage : 0);
+          let baseSurchargeAmount;
+          if (codeType === 'flat') {
+            baseSurchargeAmount = codeAmount;
+          } else {
+            baseSurchargeAmount = adjustedServiceCost * (codeAmount / 100);
+          }
+          totalSurcharge += baseSurchargeAmount * factor;
+        });
+      }
+      const subtotalBeforePuc = adjustedServiceCost + totalSurcharge;
+      let pucSurchargeAmount = 0;
+      if (pucSurcharge > 0) {
+        pucSurchargeAmount = subtotalBeforePuc * (pucSurcharge / 100);
+      }
+      return { subtotalBeforePuc, pucSurchargeAmount, adjustedServiceCost, totalSurcharge };
+    }
+
+    /**
+     * Current-cycle amount still owed, reconciling aggregate currentMonthPaid with per-category buckets.
+     * When they match (normal POS / saved data), use before-payment minus aggregate.
+     * When they disagree (e.g. deposit applied only to aggregate), use sewer/tax/late remainings so Total Due matches the breakdown lines.
+     */
+    function getCurrentCycleDueWithPaymentConsistency(customer, lateFeeAmount, parts) {
+      const {
+        subtotalBeforePuc,
+        pucSurchargeAmount,
+        adjustedServiceCost,
+        totalSurcharge
+      } = parts;
+      const paidSewer = parseFloat(customer.currentMonthPaidSewer || 0);
+      const paidTax = parseFloat(customer.currentMonthPaidTaxCodes || 0);
+      const paidLate = parseFloat(customer.currentMonthPaidLateFee || 0);
+      const splitSum = paidSewer + paidTax + paidLate;
+      const aggregatePaid = parseFloat(customer.currentMonthPaid || 0);
+      const before = subtotalBeforePuc + pucSurchargeAmount + (lateFeeAmount || 0);
+
+      if (Math.abs(aggregatePaid - splitSum) < 0.02) {
+        return Math.max(0, Math.round((before - aggregatePaid) * 100) / 100);
+      }
+      const sewerRem = Math.max(0, adjustedServiceCost - paidSewer);
+      const taxRem = Math.max(0, totalSurcharge + pucSurchargeAmount - paidTax);
+      const lateRem = Math.max(0, (lateFeeAmount || 0) - paidLate);
+      return Math.max(0, Math.round((sewerRem + taxRem + lateRem) * 100) / 100);
+    }
+
+    /**
+     * Total still owed for late / fee purposes, given calendar days late (avoids recursion with getAutomaticLateFeeAmount).
+     */
+    function getTotalOwedForLateTracking(customer, calendarDaysLate) {
+      const parts = getSubtotalBeforePucAndPucSurcharge(customer);
+      const lateFeeAmt = getLateFeeAmountForCustomerAndDaysLate(customer, calendarDaysLate);
+      const pastDueRaw = parseFloat(customer.pastDue || 0);
+      const pastDue = Math.max(0, pastDueRaw);
+      const credit = Math.abs(Math.min(0, pastDueRaw));
+      const currentDue = getCurrentCycleDueWithPaymentConsistency(customer, lateFeeAmt, parts);
+      return currentDue + pastDue - credit;
+    }
+
+    // Days late for UI + 30/60/90 search: calendar days *after* the 20-day grace from last bill print.
+    // Example: 25 days since print → 5 days late. During grace, returns 0 (not yet "late" for this count).
+    // Same basis as late fees: getCalendarDaysLateAfterGrace(customer, 20).
+    function getCustomerDaysLate(customer) {
+      if (!customer) return 0;
+      if (!customer.lastBillPrintDate) return 0;
+
+      const dsp = getDaysSinceLastBillPrint(customer);
+      if (dsp === null || dsp <= 0) return 0;
+
+      const calLateForFee = getCalendarDaysLateAfterGrace(customer, 20);
+      if (calLateForFee <= 0) return 0;
+
+      const totalOwed = getTotalOwedForLateTracking(customer, calLateForFee);
+      if (totalOwed <= 0.005) return 0;
+
+      console.log('[LateLogic] getCustomerDaysLate:', {
+        customerId: customer.id,
+        accountNumber: customer.accountNumber,
+        lastBillPrintDate: customer.lastBillPrintDate,
+        daysSincePrint: dsp,
+        calendarDaysLateAfterGrace: calLateForFee,
+        totalOwed,
+        pastDue: customer.pastDue
+      });
+
+      return calLateForFee;
+    }
+
+    // Marker to confirm the latest late-logic is loaded in the browser.
+    // If you don't see this in console after a hard refresh, you're on a cached build.
+    console.log('[LateLogic] loaded: calendar-day diff v2 (current bill + pastDue)');
+
+    // Format a Date as MM/DD/YYYY using local date components.
+    function formatDateMMDDYYYY(dateObj) {
+      const month = (dateObj.getMonth() + 1).toString().padStart(2, '0');
+      const day = dateObj.getDate().toString().padStart(2, '0');
+      const year = dateObj.getFullYear();
+      return `${month}/${day}/${year}`;
+    }
+
+    // Single source of truth for "Due Date":
+    //   dueDate = bill print date + 20-day grace period (day 21 is first late day).
+    // If we don't have a bill print date (older data), fall back to prior behavior.
+    function getBillDueDateStr(customer, graceDays = 20) {
+      if (customer && customer.lastBillPrintDate) {
+        const billDate = new Date(customer.lastBillPrintDate);
+        if (!isNaN(billDate.getTime())) {
+          const dueDate = new Date(billDate.getTime() + (graceDays * 24 * 60 * 60 * 1000));
+          return formatDateMMDDYYYY(dueDate);
+        }
+      }
+
+      // Fallback: prior behavior (last day of current month)
+      const now = window.getCurrentDate ? window.getCurrentDate() : new Date();
+      const lastDayOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+      return formatDateMMDDYYYY(lastDayOfMonth);
+    }
+
+    function getBillDueDateObj(customer, graceDays = 20) {
+      if (customer && customer.lastBillPrintDate) {
+        const billDate = new Date(customer.lastBillPrintDate);
+        if (!isNaN(billDate.getTime())) {
+          return new Date(billDate.getTime() + (graceDays * 24 * 60 * 60 * 1000));
+        }
+      }
+      // Fallback: last day of current month
+      const now = window.getCurrentDate ? window.getCurrentDate() : new Date();
+      return new Date(now.getFullYear(), now.getMonth() + 1, 0);
+    }
+
+    /** Inactive / pending closing are set manually; match case-insensitively (Firestore may store "Inactive"). */
+    function isCustomerManualLifecycleStatus(customer) {
+      const ps = String(customer && customer.paymentStatus != null ? customer.paymentStatus : '').toLowerCase().trim();
+      return ps === 'inactive' || ps === 'pending closing';
+    }
+
+    // Update customer payment status based on past due and days past bill print / grace.
+    // - overdue: positive past due, OR current bill unpaid and more than 20 days late (after grace)
+    // - late: current bill unpaid, days past grace ≤ 20 (includes 20-day grace period: calLate === 0)
+    // - current: otherwise
     function updateCustomerPaymentStatus(customer) {
       // Don't change status if it's inactive or pending closing (these are manually set)
-      if (customer.paymentStatus === 'inactive' || customer.paymentStatus === 'pending closing') {
+      if (isCustomerManualLifecycleStatus(customer)) {
         return;
       }
 
-      // Handle negative pastDue (which represents credit/overpayment)
-      if (customer.pastDue > 0) {
-        customer.paymentStatus = 'overdue';
-      } else if (customer.pastDue < 0) {
-        // Negative pastDue means they have a credit
+      const pastDueVal = parseFloat(customer.pastDue || 0);
+
+      if (pastDueVal < 0) {
         customer.paymentStatus = 'current';
-      } else {
-        customer.paymentStatus = 'current';
+        return;
       }
+
+      if (pastDueVal > 0) {
+        customer.paymentStatus = 'overdue';
+        return;
+      }
+
+      if (!customer.lastBillPrintDate) {
+        customer.paymentStatus = 'current';
+        return;
+      }
+
+      const dsp = getDaysSinceLastBillPrint(customer);
+      if (dsp === null || dsp <= 0) {
+        customer.paymentStatus = 'current';
+        return;
+      }
+
+      const calLate = getCalendarDaysLateAfterGrace(customer, 20);
+      const totalOwed = getTotalOwedForLateTracking(customer, calLate);
+
+      if (totalOwed <= 0.005) {
+        customer.paymentStatus = 'current';
+        return;
+      }
+
+      if (calLate > 20) {
+        customer.paymentStatus = 'overdue';
+      } else {
+        customer.paymentStatus = 'late';
+      }
+    }
+
+    /** Badge CSS for customer payment status (tables, search, payment module). */
+    function getPaymentStatusBadgeClass(customer) {
+      const ps = customer && customer.paymentStatus;
+      if (ps === 'overdue') {
+        return 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200';
+      }
+      if (ps === 'late') {
+        return 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-100';
+      }
+      if (ps === 'inactive') {
+        return 'bg-gray-100 text-gray-800 dark:bg-gray-900 dark:text-gray-200';
+      }
+      if (ps === 'pending closing') {
+        return 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200';
+      }
+      return 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200';
+    }
+
+    /** Single-line label for status pill (includes day counts for late / overdue). */
+    function getPaymentStatusBadgeLabel(customer) {
+      const ps = customer && customer.paymentStatus;
+      if (!customer || !ps) return 'Current';
+      if (ps === 'inactive' || ps === 'pending closing') {
+        return ps.charAt(0).toUpperCase() + ps.slice(1);
+      }
+      if (ps === 'overdue') {
+        const dl = typeof getCustomerDaysLate === 'function' ? getCustomerDaysLate(customer) : 0;
+        return dl > 0 ? `Overdue (${dl} days)` : 'Overdue';
+      }
+      if (ps === 'late') {
+        if (!customer.lastBillPrintDate) return 'Late';
+        const calLate = getCalendarDaysLateAfterGrace(customer, 20);
+        const dsp = getDaysSinceLastBillPrint(customer);
+        if (calLate > 0) return `Late (${calLate} days)`;
+        if (dsp !== null && dsp > 0) return `Late (${dsp} days)`;
+        return 'Late';
+      }
+      return ps.charAt(0).toUpperCase() + ps.slice(1);
     }
 
     // Update all customer payment statuses
@@ -2996,67 +3333,14 @@
         const row = document.createElement('tr');
         row.className = 'border-b border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800';
 
-        const statusClass = customer.paymentStatus === 'overdue' 
-          ? 'bg-red-100 text-red-800' 
-          : customer.paymentStatus === 'inactive'
-          ? 'bg-gray-100 text-gray-800'
-          : customer.paymentStatus === 'pending closing'
-          ? 'bg-yellow-100 text-yellow-800'
-          : 'bg-green-100 text-green-800';
+        // Amount Due = same as Amount Breakdown (calculateCustomerTotal only — no date heuristics)
+        const calcRow = calculateCustomerTotal(customer);
+        updateCustomerPaymentStatus(customer);
 
-        const daysLate = typeof getCustomerDaysLate === 'function' ? getCustomerDaysLate(customer) : 0;
-        const statusLabel = customer.paymentStatus === 'overdue' && daysLate > 0
-          ? `Overdue (${daysLate} days)`
-          : customer.paymentStatus.charAt(0).toUpperCase() + customer.paymentStatus.slice(1);
+        const statusClass = getPaymentStatusBadgeClass(customer);
+        const statusLabel = getPaymentStatusBadgeLabel(customer);
 
-        // Calculate due date as last day of current month
-        const now = window.getCurrentDate();
-        const lastDayOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0);
-        const dueDateStr = (lastDayOfMonth.getMonth() + 1).toString().padStart(2, '0') + '/' + 
-                          lastDayOfMonth.getDate().toString().padStart(2, '0') + '/' + 
-                          lastDayOfMonth.getFullYear();
-
-        // Check if customer has paid early (before due date)
-        const hasPaidEarly = customer.lastPayment && customer.lastPayment !== 'Never' && 
-                            customer.lastPayment.includes('/') && 
-                            new Date(customer.lastPayment) < new Date(dueDateStr);
-
-        // Calculate actual amount based on breakdown logic
-        const baseServiceCost = calculateProratedServiceCost(customer);
-        const pastDue = parseFloat(customer.pastDue || 0); // Previous unpaid balance
-        const lateFeeAmount = pastDue > 0 ? lateFee : 0; // Late fee if there's past due
-
-        // Apply factor FIRST to get adjusted service cost
-        const factor = customer.factor ? parseFloat(customer.factor) : 1.0;
-        const adjustedServiceCost = baseServiceCost * factor;
-
-        // Calculate code surcharges (applied to adjusted service cost after factor, affected by factor)
-        let totalSurcharge = 0;
-        if (customer.codes && customer.codes.length > 0) {
-          customer.codes.forEach(code => {
-            const codeType = code.type || 'percentage';
-            const codeAmount = code.amount !== undefined ? code.amount : (code.percentage !== undefined ? code.percentage : 0);
-            let baseSurcharge;
-            if (codeType === 'flat') {
-              baseSurcharge = codeAmount;
-            } else {
-              baseSurcharge = adjustedServiceCost * (codeAmount / 100);
-            }
-            // Apply factor to tax codes
-            totalSurcharge += baseSurcharge * factor;
-          });
-        }
-
-        // Calculate subtotal: adjusted service cost + tax codes (both affected by factor)
-        const subtotalBeforePuc = adjustedServiceCost + totalSurcharge;
-
-        // Calculate PUC Surcharge (applied to subtotal, NOT affected by factor)
-        let pucSurchargeAmount = 0;
-        if (pucSurcharge > 0) {
-          pucSurchargeAmount = subtotalBeforePuc * (pucSurcharge / 100);
-        }
-
-        const totalAmount = hasPaidEarly ? 0 : (subtotalBeforePuc + pastDue + lateFeeAmount + pucSurchargeAmount);
+        const totalAmount = Math.max(0, calcRow.total);
 
         row.innerHTML = `
           <td class="px-6 py-4 whitespace-nowrap text-center">
@@ -3176,8 +3460,6 @@
     // Function to hide/show dashboard buttons
     window.hideDashboardButtons = function() {
 
-      console.trace('[UI][hideDashboardButtons] Stack trace:');
-
       // Try to find button container by class selector
       const buttonContainer = document.querySelector('.flex.flex-col.items-center.gap-4.mb-8.p-8.max-w-2xl.mx-auto.bg-white');
 
@@ -3226,8 +3508,6 @@
 
     window.showDashboardButtons = async function() {
 
-      console.trace('[UI][showDashboardButtons] Stack trace:');
-
       // Get current user to determine which buttons should be visible
       const effectiveUser = window.getEffectiveUser ? window.getEffectiveUser() : null;
       const userRole = window.getEffectiveRole ? window.getEffectiveRole(effectiveUser) : null;
@@ -3236,6 +3516,7 @@
       const buttonContainer = document.querySelector('.flex.flex-col.items-center.gap-4.mb-8.p-8.max-w-2xl.mx-auto.bg-white');
 
       // Also try to find by individual button IDs
+      const addClientBtn = document.getElementById('addClientButton');
       const sendBillBtn = document.getElementById('sendBillButton');
       const searchDatabaseBtn = document.getElementById('searchDatabaseButton');
       const drawerCountBtn = document.getElementById('drawerCountButton');
@@ -3325,15 +3606,14 @@
         if (businessEndOfDayBtn) businessEndOfDayBtn.classList.add('hidden');
         if (settingsBtn) settingsBtn.classList.add('hidden');
       } else {
-        // Admin/Helpdesk - show all buttons
-
-        const allButtons = [sendBillBtn, searchDatabaseBtn, drawerCountBtn, endOfDayDrawerCountBtn,
-          businessEndOfDayBtn, settingsBtn, logoutBtn, makePaymentBtn, closeOutDrawerBtn];
-        allButtons.forEach((btn) => {
-          if (btn) {
-            btn.classList.remove('hidden');
-
-          }
+        // Admin/Helpdesk - show only Add Client, $, Payments, Send Bill, Search Clients, Log Out, Settings
+        const adminButtons = [addClientBtn, makePaymentBtn, sendBillBtn, searchDatabaseBtn, settingsBtn, logoutBtn];
+        adminButtons.forEach((btn) => {
+          if (btn) btn.classList.remove('hidden');
+        });
+        // Hide drawer-related buttons for admin
+        [drawerCountBtn, endOfDayDrawerCountBtn, businessEndOfDayBtn, closeOutDrawerBtn].forEach((btn) => {
+          if (btn) btn.classList.add('hidden');
         });
       }
 
@@ -3352,12 +3632,26 @@
       }
     };
 
-    window.showBillModule = function() {
+    window.showBillModule = async function() {
       hideAllModules();
       hideDashboardButtons();
-      // Reset bill module to original form
+      const billModule = document.getElementById('billModule');
+      billModule.classList.remove('hidden');
+      billModule.innerHTML = `
+        <div class="flex flex-col items-center justify-center py-20 px-6 text-center min-h-[280px]">
+          <div class="animate-spin rounded-full h-14 w-14 border-4 border-orange-200 border-t-orange-600 dark:border-orange-900 dark:border-t-orange-400 mb-6"></div>
+          <p class="text-lg font-semibold text-slate-800 dark:text-slate-200">Loading customers…</p>
+          <p class="text-sm text-slate-500 dark:text-slate-400 mt-2 max-w-sm">Please wait while account data finishes loading.</p>
+        </div>
+      `;
+      try {
+        if (window.__billModuleCustomersReady) {
+          await window.__billModuleCustomersReady;
+        }
+      } catch (e) {
+        console.warn('Bill module: waiting for customer data', e);
+      }
       resetBillForm();
-      document.getElementById('billModule').classList.remove('hidden');
     };
 
     window.showAddClientModule = function() {
@@ -3389,7 +3683,7 @@
       hideDashboardButtons();
       const settingsModule = document.getElementById('settingsModule');
       const loadingOverlay = document.getElementById('settingsLoadingOverlay');
-      
+
       // Show settings module immediately
       settingsModule.classList.remove('hidden');
 
@@ -3398,22 +3692,22 @@
       if (paymentModule) {
         paymentModule.classList.add('hidden');
       }
-      
+
       // Show loading overlay if data might not be ready
       // Check if customers array is empty or if we're still in initial load
       const needsLoading = customers.length === 0;
-      
+
       if (needsLoading && loadingOverlay) {
         loadingOverlay.classList.remove('hidden');
       }
-      
+
       // Wait for data to be loaded if customers array is empty
       // This ensures data is ready before showing the tables
       if (needsLoading) {
         // Data might still be loading, wait a bit and check again
         let attempts = 0;
         const maxAttempts = 50; // 5 seconds max wait (50 * 100ms)
-        
+
         while (customers.length === 0 && attempts < maxAttempts) {
           await new Promise(resolve => setTimeout(resolve, 100));
           attempts++;
@@ -3431,7 +3725,7 @@
           }
         }
       }
-      
+
       // Small delay to ensure data is fully processed and UI is ready
       await new Promise(resolve => setTimeout(resolve, 50));
 
@@ -3460,12 +3754,12 @@
           testDateInput.value = `${year}-${month}-${day}`;
         }
       }
-      
+
       // Populate the settings tables
       updateSettingsCustomerTable();
       updateSettingsLocationsTable();
       updateSettingsUsersTable();
-      
+
       // Hide loading overlay once data is ready
       if (loadingOverlay) {
         loadingOverlay.classList.add('hidden');
@@ -3684,21 +3978,10 @@
         const pastDue = calc.pastDue;
         const lateFeeAmount = calc.lateFeeAmount;
 
-        // Calculate due date as last day of current month
-        const now = window.getCurrentDate();
-        const lastDayOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0);
-        const dueDateStr = (lastDayOfMonth.getMonth() + 1).toString().padStart(2, '0') + '/' + 
-                          lastDayOfMonth.getDate().toString().padStart(2, '0') + '/' + 
-                          lastDayOfMonth.getFullYear();
+        const dueDateStr = getBillDueDateStr(customer, 20);
 
         // Set up status indicator
-        const statusClass = customer.paymentStatus === 'overdue' 
-          ? 'bg-red-100 text-red-800' 
-          : customer.paymentStatus === 'inactive'
-          ? 'bg-gray-100 text-gray-800'
-          : customer.paymentStatus === 'pending closing'
-          ? 'bg-yellow-100 text-yellow-800'
-          : 'bg-green-100 text-green-800';
+        const statusClass = getPaymentStatusBadgeClass(customer);
 
         // Clamp totalAmount to never show negative (should be $0.00 minimum)
         const displayAmount = Math.max(0, totalAmount);
@@ -3711,7 +3994,7 @@
         // Update status indicator
         const statusIndicator = document.getElementById('paymentStatusIndicator');
         statusIndicator.className = `inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${statusClass}`;
-        statusIndicator.textContent = customer.paymentStatus.charAt(0).toUpperCase() + customer.paymentStatus.slice(1);
+        statusIndicator.textContent = getPaymentStatusBadgeLabel(customer);
 
         // Update property location
         document.getElementById('paymentPropertyLocation').textContent = customer.address;
@@ -3720,16 +4003,47 @@
       }
     }
 
+    // Helper to calculate automatic late fee amount based on days late and toggle
+    function getAutomaticLateFeeAmount(customer) {
+      if (!customer) return 0;
+
+      // Respect global toggle - when OFF, we still track status but don't auto-apply fees
+      if (!autoApplyLateFees) return 0;
+
+      // Fee tiers are based on days *past the grace period*, not days since print
+      const calLate = getCalendarDaysLateAfterGrace(customer, 20);
+      if (calLate <= 0) return 0;
+
+      const totalOwed = getTotalOwedForLateTracking(customer, calLate);
+      if (totalOwed <= 0.005) return 0;
+
+      const fee = getLateFeeAmountForCustomerAndDaysLate(customer, calLate);
+
+      console.log('[LateLogic] getAutomaticLateFeeAmount:', {
+        customerId: customer.id,
+        accountNumber: customer.accountNumber,
+        calendarDaysLateAfterGrace: calLate,
+        lateFeeMode,
+        lateFeeSetting: lateFee,
+        totalLateFee: fee
+      });
+
+      return fee;
+    }
+
     // Shared function to calculate customer total amount breakdown
     // Returns an object with all calculated values
     function calculateCustomerTotal(customer) {
+
+      // Apply 60‑day deposit rule before calculating totals
+      maybeApplyDepositAt60Days(customer);
 
       const baseServiceCost = calculateProratedServiceCost(customer);
       const pastDueRaw = parseFloat(customer.pastDue || 0);
       const pastDue = Math.max(0, pastDueRaw);
       const credit = Math.abs(Math.min(0, pastDueRaw));
 
-      const lateFeeAmount = pastDue > 0 ? lateFee : 0;
+      const lateFeeAmount = getAutomaticLateFeeAmount(customer);
 
       const factor = customer.factor ? parseFloat(customer.factor) : 1.0;
       const adjustedServiceCost = baseServiceCost * factor;
@@ -3767,12 +4081,15 @@
         pucSurchargeAmount = subtotalBeforePuc * (pucSurcharge / 100);
       }
 
-      // Calculate current due before payment
       const currentDueBeforePayment = subtotalBeforePuc + pucSurchargeAmount + lateFeeAmount;
 
-      // Subtract any payments made toward the current month's bill
-      const currentMonthPaid = parseFloat(customer.currentMonthPaid || 0);
-      const currentDue = Math.max(0, currentDueBeforePayment - currentMonthPaid);
+      const subtotalParts = {
+        subtotalBeforePuc,
+        pucSurchargeAmount,
+        adjustedServiceCost,
+        totalSurcharge
+      };
+      const currentDue = getCurrentCycleDueWithPaymentConsistency(customer, lateFeeAmount, subtotalParts);
 
       const total = currentDue + pastDue - credit;
 
@@ -3785,9 +4102,79 @@
         totalSurcharge,
         subtotalBeforePuc,
         pucSurchargeAmount,
+        currentDueBeforePayment,
         currentDue,
         total
       };
+    }
+
+    /**
+     * After a successful bill PDF: unpaid current-cycle balance (after payments) rolls into pastDue,
+     * and current-month payment buckets reset — next view shows prior balance + a new period's charges.
+     * @param {object} customer - mutated in place
+     * @param {object} calc - result of calculateCustomerTotal(customer) for the bill that was just printed
+     */
+    function applyBillProductionRollForward(customer, calc) {
+      if (!customer || !calc) return;
+      // Total that was due on the bill just printed (for Amount Breakdown "Last Amount Due" when no payment row yet)
+      const statementTotal = Math.max(0, parseFloat(calc.total) || 0);
+      customer.lastPrintedStatementTotalDue = Math.round(statementTotal * 100) / 100;
+
+      const unpaidCurrent = Math.max(0, parseFloat(calc.currentDue) || 0);
+      const prevPastDue = parseFloat(customer.pastDue || 0);
+      customer.pastDue = Math.round((prevPastDue + unpaidCurrent) * 100) / 100;
+
+      customer.currentMonthPaid = 0;
+      customer.currentMonthPaidSewer = 0;
+      customer.currentMonthPaidTaxCodes = 0;
+      customer.currentMonthPaidLateFee = 0;
+      customer.currentMonthPaymentHistory = [];
+
+      updateCustomerPaymentStatus(customer);
+
+      console.log('[BillingRoll] applyBillProductionRollForward:', {
+        customerId: customer.id,
+        accountNumber: customer.accountNumber,
+        unpaidCurrentRolledIntoPastDue: unpaidCurrent,
+        newPastDue: customer.pastDue
+      });
+    }
+
+    /** Tax/PDF line items for bill (codes + PUC), consistent with calculateCustomerTotal. */
+    function buildTaxCodeDetailsForPdf(customer, calc) {
+      const factor = customer.factor ? parseFloat(customer.factor) : 1.0;
+      const adjustedServiceCost = calc.adjustedServiceCost;
+      const taxCodeDetails = [];
+      if (customer.codes && customer.codes.length > 0) {
+        customer.codes.forEach(customerCode => {
+          let latestCode = codes.find(c => c.id === customerCode.id);
+          if (!latestCode) {
+            latestCode = codes.find(c => c.name.toLowerCase() === customerCode.name.toLowerCase());
+          }
+          const codeToUse = latestCode || customerCode;
+          const codeType = codeToUse.type || 'percentage';
+          const codeAmount = codeToUse.amount !== undefined ? codeToUse.amount : (codeToUse.percentage !== undefined ? codeToUse.percentage : 0);
+          let baseSurchargeAmount;
+          if (codeType === 'flat') {
+            baseSurchargeAmount = codeAmount;
+          } else {
+            baseSurchargeAmount = adjustedServiceCost * (codeAmount / 100);
+          }
+          const surchargeAmount = baseSurchargeAmount * factor;
+          taxCodeDetails.push({
+            name: codeToUse.name,
+            amount: surchargeAmount
+          });
+        });
+      }
+      taxCodeDetails.sort((a, b) => a.name.localeCompare(b.name));
+      if (pucSurcharge > 0) {
+        taxCodeDetails.push({
+          name: `PUC SCHG SW (${pucSurcharge.toFixed(2)}% x $${calc.subtotalBeforePuc.toFixed(2)})`,
+          amount: calc.pucSurchargeAmount
+        });
+      }
+      return taxCodeDetails;
     }
 
     // Calculate prorated service cost based on when customer was added
@@ -3823,6 +4210,185 @@
 
       // If customer was added in a previous month, charge full amount
       return baseServiceCost;
+    }
+
+    // Apply deposit automatically when a bill reaches the 60‑day late bucket
+    function maybeApplyDepositAt60Days(customer) {
+      try {
+        if (!customer) return;
+
+        const shouldLogDeposit =
+          customer.accountNumber === 'CUS-3001000' ||
+          customer.id === 'CUS-3001000';
+
+        // Only for bills generated after this feature (must have lastBillPrintDate)
+        if (!customer.lastBillPrintDate) return;
+        if (customer.lastBill60DayDepositApplied) {
+          if (shouldLogDeposit) {
+            console.log('[LateLogic] maybeApplyDepositAt60Days SKIP (already applied)', {
+              customerId: customer.id,
+              accountNumber: customer.accountNumber,
+              lastBill60DayDepositApplied: customer.lastBill60DayDepositApplied
+            });
+          }
+          return;
+        }
+
+        const calendarLate = getCalendarDaysLateAfterGrace(customer, 20);
+        // 60‑day bucket starts at 31 days late (calendar, not gated on old pastDue-only logic)
+        if (calendarLate < 31) {
+          if (shouldLogDeposit) {
+            console.log('[LateLogic] maybeApplyDepositAt60Days SKIP (not late enough)', {
+              customerId: customer.id,
+              accountNumber: customer.accountNumber,
+              calendarLate
+            });
+          }
+          return;
+        }
+
+        const deposit = parseFloat(customer.deposit || 0);
+        if (!(deposit > 0)) {
+          if (shouldLogDeposit) {
+            console.log('[LateLogic] maybeApplyDepositAt60Days SKIP (no deposit)', {
+              customerId: customer.id,
+              accountNumber: customer.accountNumber
+            });
+          }
+          return;
+        }
+
+        const totalOwed = getTotalOwedForLateTracking(customer, calendarLate);
+        if (totalOwed <= 0.005) {
+          if (shouldLogDeposit) {
+            console.log('[LateLogic] maybeApplyDepositAt60Days SKIP (nothing owed)', {
+              customerId: customer.id,
+              accountNumber: customer.accountNumber,
+              totalOwed
+            });
+          }
+          return;
+        }
+
+        const appliedRaw = Math.min(deposit, totalOwed);
+        const applied = Math.round(appliedRaw * 100) / 100;
+        if (applied <= 0) {
+          if (shouldLogDeposit) {
+            console.log('[LateLogic] maybeApplyDepositAt60Days SKIP (nothing to apply)', {
+              customerId: customer.id,
+              accountNumber: customer.accountNumber,
+              applied
+            });
+          }
+          return;
+        }
+
+        const parts = getSubtotalBeforePucAndPucSurcharge(customer);
+        const lateFeeAmt = getLateFeeAmountForCustomerAndDaysLate(customer, calendarLate);
+        const { subtotalBeforePuc, pucSurchargeAmount, adjustedServiceCost, totalSurcharge } = parts;
+        let paidSewer = parseFloat(customer.currentMonthPaidSewer || 0);
+        let paidTax = parseFloat(customer.currentMonthPaidTaxCodes || 0);
+        let paidLate = parseFloat(customer.currentMonthPaidLateFee || 0);
+        const currentDue = getCurrentCycleDueWithPaymentConsistency(customer, lateFeeAmt, parts);
+        let pastDueNum = parseFloat(customer.pastDue || 0);
+
+        if (shouldLogDeposit) {
+          console.log('[LateLogic] maybeApplyDepositAt60Days CHECK', {
+            customerId: customer.id,
+            accountNumber: customer.accountNumber,
+            calendarLate,
+            totalOwed,
+            currentDue,
+            pastDueNum,
+            deposit,
+            lastBillPrintDate: customer.lastBillPrintDate
+          });
+        }
+
+        console.log('[LateLogic] maybeApplyDepositAt60Days BEFORE:', {
+          customerId: customer.id,
+          accountNumber: customer.accountNumber,
+          calendarLate,
+          totalOwed,
+          currentDue,
+          pastDueNum,
+          deposit,
+          applied
+        });
+
+        // Latest charges first: apply to current cycle, then positive past due
+        let remaining = applied;
+        const toCurrent = Math.min(remaining, currentDue);
+        if (toCurrent > 0) {
+          const sewerUnpaid = Math.max(0, adjustedServiceCost - paidSewer);
+          const taxUnpaid = Math.max(0, totalSurcharge + pucSurchargeAmount - paidTax);
+          const lateUnpaid = Math.max(0, lateFeeAmt - paidLate);
+          const totalUnpaid = sewerUnpaid + taxUnpaid + lateUnpaid;
+
+          if (totalUnpaid > 0.005) {
+            let addS = Math.round(toCurrent * (sewerUnpaid / totalUnpaid) * 100) / 100;
+            let addT = Math.round(toCurrent * (taxUnpaid / totalUnpaid) * 100) / 100;
+            let addL = Math.round((toCurrent - addS - addT) * 100) / 100;
+            paidSewer = Math.round((paidSewer + addS) * 100) / 100;
+            paidTax = Math.round((paidTax + addT) * 100) / 100;
+            paidLate = Math.round((paidLate + addL) * 100) / 100;
+          } else {
+            paidSewer = Math.round((paidSewer + toCurrent) * 100) / 100;
+          }
+          customer.currentMonthPaidSewer = paidSewer;
+          customer.currentMonthPaidTaxCodes = paidTax;
+          customer.currentMonthPaidLateFee = paidLate;
+          customer.currentMonthPaid = Math.round((paidSewer + paidTax + paidLate) * 100) / 100;
+          remaining = Math.round((remaining - toCurrent) * 100) / 100;
+        }
+        if (remaining > 0) {
+          const pdPositive = Math.max(0, pastDueNum);
+          const toPast = Math.min(remaining, pdPositive);
+          if (toPast > 0) {
+            customer.pastDue = Math.round((pastDueNum - toPast) * 100) / 100;
+            remaining = Math.round((remaining - toPast) * 100) / 100;
+          }
+        }
+
+        // Billing trail: record like a real payment so Amount Breakdown shows last amount due / last payment paid
+        const today = window.getCurrentDate ? window.getCurrentDate() : new Date();
+        const depDateStr = (today.getMonth() + 1).toString().padStart(2, '0') + '/' +
+          today.getDate().toString().padStart(2, '0') + '/' + today.getFullYear();
+        if (!Array.isArray(customer.paymentHistory)) {
+          customer.paymentHistory = [];
+        }
+        customer.paymentHistory.push({
+          date: depDateStr,
+          timestamp: today.toISOString(),
+          amountDue: Math.round(totalOwed * 100) / 100,
+          amountPaid: applied,
+          creditGiven: null,
+          paymentMethod: 'Security deposit (auto)',
+          source: 'depositAutoApply'
+        });
+        customer.lastPayment = depDateStr;
+        customer.lastPrintedStatementTotalDue = Math.round(totalOwed * 100) / 100;
+
+        customer.deposit = Math.round((deposit - applied) * 100) / 100;
+        customer.lastBill60DayDepositApplied = true;
+
+        // Persist asynchronously; don't block UI
+        if (typeof saveSingleCustomerToFirestore === 'function') {
+          saveSingleCustomerToFirestore(customer).catch(() => {});
+        }
+
+        console.log('[LateLogic] maybeApplyDepositAt60Days AFTER:', {
+          customerId: customer.id,
+          accountNumber: customer.accountNumber,
+          calendarLate,
+          newPastDue: customer.pastDue,
+          newCurrentMonthPaid: customer.currentMonthPaid,
+          newDeposit: customer.deposit,
+          lastBill60DayDepositApplied: customer.lastBill60DayDepositApplied
+        });
+      } catch (e) {
+        // Fail silently for now; logic will re-evaluate on next calculation if needed
+      }
     }
 
     function hideCustomerPaymentInfo() {
@@ -3864,62 +4430,35 @@
     function showCustomerBillInfo(customerId) {
       const customer = customers.find(c => c.id === customerId);
       if (customer) {
-        // Calculate prorated service cost based on when customer was added
-        const baseServiceCost = calculateProratedServiceCost(customer);
-        const pastDue = parseFloat(customer.pastDue || 0); // Previous unpaid balance
-        const lateFeeAmount = pastDue > 0 ? lateFee : 0; // Late fee if there's past due
+        // Single source of truth with Amount Breakdown modal, payments, and PDF (see calculateCustomerTotal)
+        const calc = calculateCustomerTotal(customer);
+        const totalAmount = Math.max(0, calc.total);
+        const lateFeeAmount = calc.lateFeeAmount;
 
-        // Apply factor FIRST to get adjusted service cost
-        const factor = customer.factor ? parseFloat(customer.factor) : 1.0;
-        const adjustedServiceCost = baseServiceCost * factor;
+        console.log('[LateLogic] showCustomerBillInfo:', {
+          customerId: customer.id,
+          accountNumber: customer.accountNumber,
+          totalAmount,
+          lateFeeAmount,
+          subtotalBeforePuc: calc.subtotalBeforePuc,
+          pucSurchargeAmount: calc.pucSurchargeAmount,
+          pastDue: calc.pastDue
+        });
 
-        // Calculate PUC Surcharge first (applied to adjusted service cost after factor, before other codes)
-        let pucSurchargeAmount = 0;
-        if (pucSurcharge > 0) {
-          pucSurchargeAmount = adjustedServiceCost * (pucSurcharge / 100);
-        }
-
-        // Calculate code surcharges (applied to adjusted service cost after factor)
-        let totalSurcharge = 0;
-        if (customer.codes && customer.codes.length > 0) {
-          customer.codes.forEach(code => {
-            const codeType = code.type || 'percentage';
-            const codeAmount = code.amount !== undefined ? code.amount : (code.percentage !== undefined ? code.percentage : 0);
-            if (codeType === 'flat') {
-              totalSurcharge += codeAmount;
-            } else {
-              totalSurcharge += adjustedServiceCost * (codeAmount / 100);
-            }
-          });
-        }
-
-        const totalAmount = adjustedServiceCost + pastDue + lateFeeAmount + pucSurchargeAmount + totalSurcharge;
-
-        // Calculate due date as last day of current month
-        const now = window.getCurrentDate();
-        const lastDayOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0);
-        const dueDateStr = (lastDayOfMonth.getMonth() + 1).toString().padStart(2, '0') + '/' + 
-                          lastDayOfMonth.getDate().toString().padStart(2, '0') + '/' + 
-                          lastDayOfMonth.getFullYear();
+        const dueDateStr = getBillDueDateStr(customer, 20);
 
         // Set up status indicator
-        const statusClass = customer.paymentStatus === 'overdue' 
-          ? 'bg-red-100 text-red-800' 
-          : customer.paymentStatus === 'inactive'
-          ? 'bg-gray-100 text-gray-800'
-          : customer.paymentStatus === 'pending closing'
-          ? 'bg-yellow-100 text-yellow-800'
-          : 'bg-green-100 text-green-800';
+        const statusClass = getPaymentStatusBadgeClass(customer);
 
         document.getElementById('billAmountDue').textContent = `$${totalAmount.toFixed(2)}`;
-        document.getElementById('billPastDue').textContent = `$${customer.pastDue.toFixed(2)}`;
+        document.getElementById('billPastDue').textContent = `$${parseFloat(customer.pastDue || 0).toFixed(2)}`;
         document.getElementById('billDueDate').textContent = dueDateStr;
         document.getElementById('billLateFee').textContent = `$${lateFeeAmount.toFixed(2)}`;
 
         // Update status indicator
         const statusIndicator = document.getElementById('billStatusIndicator');
         statusIndicator.className = `inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${statusClass}`;
-        statusIndicator.textContent = customer.paymentStatus.charAt(0).toUpperCase() + customer.paymentStatus.slice(1);
+        statusIndicator.textContent = getPaymentStatusBadgeLabel(customer);
 
         // Update property location
         document.getElementById('billPropertyLocation').textContent = customer.address;
@@ -4059,58 +4598,27 @@
       }
 
       try {
-        // Calculate all the amounts (same logic as showCustomerBillInfo)
-        const baseServiceCost = calculateProratedServiceCost(customer);
-        const pastDue = parseFloat(customer.pastDue || 0); // Previous unpaid balance
-        const lateFeeAmount = pastDue > 0 ? lateFee : 0; // Late fee if there's past due
+        console.log('[LateLogic] produceBill START for customer:', {
+          customerId: customer.id,
+          accountNumber: customer.accountNumber,
+          pastDue: customer.pastDue,
+          deposit: customer.deposit,
+          lastBillPrintDate: customer.lastBillPrintDate,
+          lastBill60DayDepositApplied: customer.lastBill60DayDepositApplied
+        });
 
-        // Apply factor FIRST to get adjusted service cost
+        // Same totals as Amount Breakdown modal (PUC on sewer + codes, factor on codes, late fee, payments, 60-day deposit)
+        const calc = calculateCustomerTotal(customer);
         const factor = customer.factor ? parseFloat(customer.factor) : 1.0;
-        const adjustedServiceCost = baseServiceCost * factor;
+        const adjustedServiceCost = calc.adjustedServiceCost;
+        const pastDue = parseFloat(customer.pastDue || 0);
+        const lateFeeAmount = calc.lateFeeAmount;
 
-        // Calculate PUC Surcharge first (applied to adjusted service cost after factor, before other codes)
-        let pucSurchargeAmount = 0;
-        if (pucSurcharge > 0) {
-          pucSurchargeAmount = adjustedServiceCost * (pucSurcharge / 100);
-        }
+        const taxCodeDetails = buildTaxCodeDetailsForPdf(customer, calc);
 
-        // Calculate code surcharges (applied to adjusted service cost after factor)
-        let totalSurcharge = 0;
-        const taxCodeDetails = []; // Array to store tax code names and amounts
-
-        if (customer.codes && customer.codes.length > 0) {
-          customer.codes.forEach(customerCode => {
-            // Look up the latest code data from the global codes array
-            let latestCode = codes.find(c => c.id === customerCode.id);
-            if (!latestCode) {
-              latestCode = codes.find(c => c.name.toLowerCase() === customerCode.name.toLowerCase());
-            }
-            const codeToUse = latestCode || customerCode;
-
-            const codeType = codeToUse.type || 'percentage';
-            const codeAmount = codeToUse.amount !== undefined ? codeToUse.amount : (codeToUse.percentage !== undefined ? codeToUse.percentage : 0);
-
-            let baseSurchargeAmount;
-            if (codeType === 'flat') {
-              baseSurchargeAmount = codeAmount;
-            } else {
-              baseSurchargeAmount = adjustedServiceCost * (codeAmount / 100);
-            }
-            const surchargeAmount = baseSurchargeAmount * factor;
-            totalSurcharge += surchargeAmount;
-
-            // Store tax code details for PDF
-            taxCodeDetails.push({
-              name: codeToUse.name,
-              amount: surchargeAmount
-            });
-          });
-        }
-
-        // Sort tax codes alphabetically by name (same as in showAmountDetails)
-        taxCodeDetails.sort((a, b) => a.name.localeCompare(b.name));
-
-        const totalAmount = adjustedServiceCost + pastDue + lateFeeAmount + pucSurchargeAmount + totalSurcharge;
+        const totalSurcharge = calc.totalSurcharge;
+        const subtotalBeforePuc = calc.subtotalBeforePuc;
+        const pucSurchargeAmountRecalc = calc.pucSurchargeAmount;
 
         // Calculate dates
         const now = window.getCurrentDate();
@@ -4129,40 +4637,69 @@
                           String(lastDayOfMonth.getFullYear()).slice(-2);
         const cyclePeriod = `${firstDayStr} to ${lastDayStr}`;
 
-        // Due date is the last day of the billing cycle month (same as lastDayOfMonth)
-        const dueDateStr = (lastDayOfMonth.getMonth() + 1).toString().padStart(2, '0') + '/' + 
-                          lastDayOfMonth.getDate().toString().padStart(2, '0') + '/' + 
-                          lastDayOfMonth.getFullYear();
+        // Due date is tied to the bill print date (day 20 grace).
+        const dueDateStr = formatDateMMDDYYYY(
+          new Date(now.getTime() + (20 * 24 * 60 * 60 * 1000))
+        );
 
         // Create FormData with all the required fields
         const formData = new FormData();
+        // Build address_city_state_zip (e.g. "Salinas, CA, 93907")
+        const imp = customer.importData || {};
+        const mailingCity = customer.mailingCity || imp['Mailing City'] || imp['City'] || imp['PremiseCity'] || '';
+        const mailingState = customer.mailingState || imp['Mailing State'] || imp['State'] || imp['PremiseState'] || '';
+        const mailingZip = customer.mailingZip || imp['Mailing ZIP'] || imp['ZIP'] || imp['Zip'] || imp['PremiseZip'] || '';
+        const addressCityStateZip = [mailingCity, mailingState, mailingZip].filter(Boolean).join(', ');
+
+        const daysInCycle = lastDayOfMonth.getDate();
+
         formData.append('account_no', customer.accountNumber || '');
         formData.append('account_name', customer.name || '');
         formData.append('account_address', customer.address || '');
+        formData.append('address_city_state_zip', addressCityStateZip);
         formData.append('statement_date', statementDate);
         formData.append('cycle_period', cyclePeriod);
+        formData.append('days_in_cycle', String(daysInCycle));
+        formData.append('print_date', formatDateMMDDYYYY(now));
         formData.append('current_charges', `$${adjustedServiceCost.toFixed(2)}`);
         formData.append('previous_charges', `$${customer.pastDue.toFixed(2)}`);
-        // Calculate subtotal before PUC (adjusted service cost + tax codes)
-        const subtotalBeforePuc = adjustedServiceCost + totalSurcharge;
 
-        // Recalculate PUC surcharge based on subtotal before PUC
-        let pucSurchargeAmountRecalc = 0;
-        if (pucSurcharge > 0) {
-          pucSurchargeAmountRecalc = subtotalBeforePuc * (pucSurcharge / 100);
-          // Add PUC Surcharge to tax codes list with proper display text
-          taxCodeDetails.push({
-            name: `PUC SCHG SW (${pucSurcharge.toFixed(2)}% x $${subtotalBeforePuc.toFixed(2)})`,
-            amount: pucSurchargeAmountRecalc
-          });
-        }
+        const totalAmountRecalc = Math.max(0, calc.total);
 
-        const currentDue = subtotalBeforePuc + pucSurchargeAmountRecalc + lateFeeAmount;
-        const totalAmountRecalc = currentDue + pastDue;
+        console.log('[LateLogic] produceBill amounts:', {
+          customerId: customer.id,
+          accountNumber: customer.accountNumber,
+          baseServiceCost: calc.baseServiceCost,
+          factor,
+          adjustedServiceCost,
+          pastDue,
+          lateFeeAmount,
+          pucSurchargeAmountRecalc,
+          totalSurcharge,
+          subtotalBeforePuc,
+          currentDue: calc.currentDue,
+          totalAmountRecalc
+        });
 
         formData.append('taxes_charges', `$${totalSurcharge.toFixed(2)}`);
         formData.append('total_amount', `$${totalAmountRecalc.toFixed(2)}`);
         formData.append('due_date', dueDateStr);
+
+        // Bill status text for PDF ("Status: Current" or "Status: X days late")
+        // Uses the same days-late logic as the rest of the app.
+        const daysLateForBill = getCustomerDaysLate(customer);
+        let statusText = 'Status: Current';
+        if (daysLateForBill > 0) {
+          statusText = `Status: ${daysLateForBill} days late`;
+        }
+        formData.append('status', statusText);
+
+        console.log('[LateLogic] produceBill status for PDF:', {
+          customerId: customer.id,
+          accountNumber: customer.accountNumber,
+          daysLateForBill,
+          statusText
+        });
 
         // Populate tax code fields (tax1, tax2, tax3, etc. and tax_charge1, tax_charge2, tax_charge3, etc.)
         // Limit to first 10 tax codes to match PDF field limits
@@ -4262,6 +4799,40 @@
           }
         }
 
+        // Real-world billing: roll unpaid current statement into pastDue, reset current-month payments, then new print date
+        try {
+          applyBillProductionRollForward(customer, calc);
+          customer.lastBillPrintDate = now.toISOString();
+          customer.lastBill60DayDepositApplied = false;
+
+          console.log('[LateLogic] produceBill AFTER PDF:', {
+            customerId: customer.id,
+            accountNumber: customer.accountNumber,
+            savedLastBillPrintDate: customer.lastBillPrintDate,
+            lastBill60DayDepositApplied: customer.lastBill60DayDepositApplied,
+            pastDueAfterRoll: customer.pastDue
+          });
+
+          if (typeof saveSingleCustomerToFirestore === 'function') {
+            await saveSingleCustomerToFirestore(customer);
+          }
+
+          if (typeof showCustomerBillInfo === 'function') {
+            showCustomerBillInfo(customerId);
+          }
+          if (typeof updateCustomerTable === 'function') {
+            updateCustomerTable();
+          }
+          if (typeof updateSettingsCustomerTable === 'function') {
+            updateSettingsCustomerTable();
+          }
+          if (typeof updateDashboard === 'function') {
+            updateDashboard();
+          }
+        } catch (e) {
+          console.error('[LateLogic] produceBill: failed to persist roll-forward / lastBillPrintDate', e);
+        }
+
         alert('Bill PDF generated successfully!');
       } catch (error) {
         alert('Failed to generate bill PDF: ' + error.message);
@@ -4340,9 +4911,9 @@
                           lastDayOfMonth.getDate().toString().padStart(2, '0') + '/' + 
                           String(lastDayOfMonth.getFullYear()).slice(-2);
         const cyclePeriod = `${firstDayStr} to ${lastDayStr}`;
-        const dueDateStr = (lastDayOfMonth.getMonth() + 1).toString().padStart(2, '0') + '/' + 
-                          lastDayOfMonth.getDate().toString().padStart(2, '0') + '/' + 
-                          lastDayOfMonth.getFullYear();
+        const dueDateStr = formatDateMMDDYYYY(
+          new Date(now.getTime() + (20 * 24 * 60 * 60 * 1000))
+        );
 
         // Create snapshot with all customer data and calculations
         const billingCycleSnapshot = {
@@ -4356,6 +4927,7 @@
           settings: {
             sewerCharge: sewerCharge,
             lateFee: lateFee,
+            lateFeeMode: lateFeeMode,
             pucSurcharge: pucSurcharge,
             codes: JSON.parse(JSON.stringify(codes)) // Deep copy
           },
@@ -4372,45 +4944,24 @@
 
         for (const customer of cycleCustomers) {
           try {
-            // Calculate all the amounts (same logic as produceBill)
-            const baseServiceCost = calculateProratedServiceCost(customer);
-            const pastDue = parseFloat(customer.pastDue || 0);
-            const lateFeeAmount = pastDue > 0 ? lateFee : 0;
-
+            const calc = calculateCustomerTotal(customer);
             const factor = customer.factor ? parseFloat(customer.factor) : 1.0;
-            const adjustedServiceCost = baseServiceCost * factor;
+            const adjustedServiceCost = calc.adjustedServiceCost;
+            const pastDueOpening = parseFloat(customer.pastDue || 0);
+            const lateFeeAmount = calc.lateFeeAmount;
+            const totalSurcharge = calc.totalSurcharge;
+            const subtotalBeforePuc = calc.subtotalBeforePuc;
+            const pucSurchargeAmount = calc.pucSurchargeAmount;
+            const currentDue = calc.currentDue;
+            const totalAmount = Math.max(0, calc.total);
 
-            // Calculate tax codes
-            let totalSurcharge = 0;
-            if (customer.codes && customer.codes.length > 0) {
-              customer.codes.forEach(code => {
-                const codeType = code.type || 'percentage';
-                const codeAmount = code.amount !== undefined ? code.amount : (code.percentage !== undefined ? code.percentage : 0);
-                if (codeType === 'flat') {
-                  totalSurcharge += codeAmount;
-                } else {
-                  totalSurcharge += adjustedServiceCost * (codeAmount / 100);
-                }
-              });
-            }
-
-            // Calculate PUC Surcharge
-            const subtotalBeforePuc = adjustedServiceCost + totalSurcharge;
-            let pucSurchargeAmount = 0;
-            if (pucSurcharge > 0) {
-              pucSurchargeAmount = subtotalBeforePuc * (pucSurcharge / 100);
-            }
-
-            const currentDue = subtotalBeforePuc + pucSurchargeAmount + lateFeeAmount;
-            const totalAmount = currentDue + pastDue;
-
-            // Save customer snapshot with all calculations
+            // Save customer snapshot (pre–roll-forward, matches PDF)
             const customerSnapshot = {
               customerId: customer.id,
-              customerData: JSON.parse(JSON.stringify(customer)), // Deep copy of customer data
+              customerData: JSON.parse(JSON.stringify(customer)),
               calculations: {
-                baseServiceCost: baseServiceCost,
-                pastDue: pastDue,
+                baseServiceCost: calc.baseServiceCost,
+                pastDue: pastDueOpening,
                 lateFeeAmount: lateFeeAmount,
                 factor: factor,
                 adjustedServiceCost: adjustedServiceCost,
@@ -4424,10 +4975,19 @@
                 account_no: customer.accountNumber || '',
                 account_name: customer.name || '',
                 account_address: customer.address || '',
+                address_city_state_zip: (() => {
+                  const imp = customer.importData || {};
+                  const c = customer.mailingCity || imp['Mailing City'] || imp['City'] || imp['PremiseCity'] || '';
+                  const s = customer.mailingState || imp['Mailing State'] || imp['State'] || imp['PremiseState'] || '';
+                  const z = customer.mailingZip || imp['Mailing ZIP'] || imp['ZIP'] || imp['Zip'] || imp['PremiseZip'] || '';
+                  return [c, s, z].filter(Boolean).join(', ');
+                })(),
                 statement_date: statementDate,
                 cycle_period: cyclePeriod,
+                days_in_cycle: lastDayOfMonth.getDate(),
+                print_date: formatDateMMDDYYYY(now),
                 current_charges: `$${adjustedServiceCost.toFixed(2)}`,
-                previous_charges: `$${customer.pastDue.toFixed(2)}`,
+                previous_charges: `$${pastDueOpening.toFixed(2)}`,
                 taxes_charges: `$${totalSurcharge.toFixed(2)}`,
                 total_amount: `$${totalAmount.toFixed(2)}`,
                 due_date: dueDateStr
@@ -4435,20 +4995,42 @@
             };
             billingCycleSnapshot.customerSnapshots.push(customerSnapshot);
 
-            // Create FormData
+            const taxCodeDetails = buildTaxCodeDetailsForPdf(customer, calc);
             const formData = new FormData();
             formData.append('account_no', customerSnapshot.pdfData.account_no);
             formData.append('account_name', customerSnapshot.pdfData.account_name);
             formData.append('account_address', customerSnapshot.pdfData.account_address);
+            formData.append('address_city_state_zip', customerSnapshot.pdfData.address_city_state_zip || '');
             formData.append('statement_date', customerSnapshot.pdfData.statement_date);
             formData.append('cycle_period', customerSnapshot.pdfData.cycle_period);
+            formData.append('days_in_cycle', String(customerSnapshot.pdfData.days_in_cycle || ''));
+            formData.append('print_date', customerSnapshot.pdfData.print_date || '');
             formData.append('current_charges', customerSnapshot.pdfData.current_charges);
             formData.append('previous_charges', customerSnapshot.pdfData.previous_charges);
             formData.append('taxes_charges', customerSnapshot.pdfData.taxes_charges);
             formData.append('total_amount', customerSnapshot.pdfData.total_amount);
             formData.append('due_date', customerSnapshot.pdfData.due_date);
 
-            // Generate PDF
+            const daysLateForBill = getCustomerDaysLate(customer);
+            let statusText = 'Status: Current';
+            if (daysLateForBill > 0) {
+              statusText = `Status: ${daysLateForBill} days late`;
+            }
+            formData.append('status', statusText);
+
+            const maxTaxCodes = 10;
+            for (let i = 0; i < maxTaxCodes; i++) {
+              const taxIndex = i + 1;
+              if (i < taxCodeDetails.length) {
+                const taxCode = taxCodeDetails[i];
+                formData.append(`tax${taxIndex}`, taxCode.name || '');
+                formData.append(`tax_charge${taxIndex}`, `$${taxCode.amount.toFixed(2)}`);
+              } else {
+                formData.append(`tax${taxIndex}`, '');
+                formData.append(`tax_charge${taxIndex}`, '');
+              }
+            }
+
             const response = await fetch('/edit_pdf?pdf=bill', {
               method: 'POST',
               body: formData
@@ -4458,14 +5040,17 @@
               throw new Error(`Failed to generate PDF for ${customer.name}`);
             }
 
-            // Get PDF blob
             const blob = await response.blob();
 
-            // Sanitize customer name for filename (remove special characters)
+            applyBillProductionRollForward(customer, calc);
+            customer.lastBillPrintDate = now.toISOString();
+            customer.lastBill60DayDepositApplied = false;
+            if (typeof saveSingleCustomerToFirestore === 'function') {
+              await saveSingleCustomerToFirestore(customer);
+            }
+
             const sanitizedName = customer.name.replace(/[^a-z0-9]/gi, '_').toLowerCase();
             const filename = `${sanitizedName}-${dateStr}.pdf`;
-
-            // Add to zip
             zip.file(filename, blob);
             successCount++;
 
@@ -4497,6 +5082,16 @@
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(downloadUrl);
+
+        if (typeof updateCustomerTable === 'function') {
+          updateCustomerTable();
+        }
+        if (typeof updateSettingsCustomerTable === 'function') {
+          updateSettingsCustomerTable();
+        }
+        if (typeof updateDashboard === 'function') {
+          updateDashboard();
+        }
 
         // Restore button
         if (produceButton) {
@@ -5293,7 +5888,6 @@
     // Reset payment form
     window.resetPaymentForm = function(keepHidden = false) {
 
-      console.trace('[FLOW][resetPaymentForm][STEP 1.1] Stack trace to see who called this:');
       const paymentModule = document.getElementById('paymentModule');
 
       // Restore session from localStorage if it doesn't exist in memory
@@ -9342,18 +9936,8 @@
         const lateFeeAmount = customer.pastDue > 0 ? lateFee : 0;
         const totalAmount = serviceCost + lateFeeAmount;
 
-        const statusClass = customer.paymentStatus === 'overdue' ? 
-          'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200' : 
-          customer.paymentStatus === 'inactive' ?
-          'bg-gray-100 text-gray-800 dark:bg-gray-900 dark:text-gray-200' :
-          customer.paymentStatus === 'pending closing' ?
-          'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200' :
-          'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200';
-
-        const daysLate = typeof getCustomerDaysLate === 'function' ? getCustomerDaysLate(customer) : 0;
-        const statusLabel = customer.paymentStatus === 'overdue' && daysLate > 0
-          ? `${customer.paymentStatus.charAt(0).toUpperCase() + customer.paymentStatus.slice(1)} (${daysLate} days late)`
-          : customer.paymentStatus.charAt(0).toUpperCase() + customer.paymentStatus.slice(1);
+        const statusClass = getPaymentStatusBadgeClass(customer);
+        const statusLabel = getPaymentStatusBadgeLabel(customer);
 
         html += `
           <div class="bg-slate-50 dark:bg-slate-700 p-4 rounded-xl">
@@ -9691,14 +10275,14 @@
         for (let i = 0; i < customerDocs.length; i += batchSize) {
           const batch = writeBatch(db);
           const batchDocs = customerDocs.slice(i, Math.min(i + batchSize, customerDocs.length));
-          
+
           batchDocs.forEach(doc => {
             batch.delete(doc.ref);
           });
 
           await batch.commit();
           deletedCount += batchDocs.length;
-          
+
           // Small delay between batches to avoid rate limiting
           if (i + batchSize < customerDocs.length) {
             await new Promise(resolve => setTimeout(resolve, 200));
@@ -10010,67 +10594,14 @@
         const row = document.createElement('tr');
         row.className = 'border-b border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800';
 
-        const statusClass = customer.paymentStatus === 'overdue' 
-          ? 'bg-red-100 text-red-800' 
-          : customer.paymentStatus === 'inactive'
-          ? 'bg-gray-100 text-gray-800'
-          : customer.paymentStatus === 'pending closing'
-          ? 'bg-yellow-100 text-yellow-800'
-          : 'bg-green-100 text-green-800';
+        // Amount Due = same as Amount Breakdown (calculateCustomerTotal only — no date heuristics)
+        const calcRow = calculateCustomerTotal(customer);
+        updateCustomerPaymentStatus(customer);
 
-        const daysLate = typeof getCustomerDaysLate === 'function' ? getCustomerDaysLate(customer) : 0;
-        const statusLabel = customer.paymentStatus === 'overdue' && daysLate > 0
-          ? `Overdue (${daysLate} days)`
-          : customer.paymentStatus.charAt(0).toUpperCase() + customer.paymentStatus.slice(1);
+        const statusClass = getPaymentStatusBadgeClass(customer);
+        const statusLabel = getPaymentStatusBadgeLabel(customer);
 
-        // Calculate due date as last day of current month
-        const now = window.getCurrentDate();
-        const lastDayOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0);
-        const dueDateStr = (lastDayOfMonth.getMonth() + 1).toString().padStart(2, '0') + '/' + 
-                          lastDayOfMonth.getDate().toString().padStart(2, '0') + '/' + 
-                          lastDayOfMonth.getFullYear();
-
-        // Check if customer has paid early (before due date)
-        const hasPaidEarly = customer.lastPayment && customer.lastPayment !== 'Never' && 
-                            customer.lastPayment.includes('/') && 
-                            new Date(customer.lastPayment) < new Date(dueDateStr);
-
-        // Calculate actual amount based on breakdown logic
-        const baseServiceCost = calculateProratedServiceCost(customer);
-        const pastDue = parseFloat(customer.pastDue || 0); // Previous unpaid balance
-        const lateFeeAmount = pastDue > 0 ? lateFee : 0; // Late fee if there's past due
-
-        // Apply factor FIRST to get adjusted service cost
-        const factor = customer.factor ? parseFloat(customer.factor) : 1.0;
-        const adjustedServiceCost = baseServiceCost * factor;
-
-        // Calculate code surcharges (applied to adjusted service cost after factor, affected by factor)
-        let totalSurcharge = 0;
-        if (customer.codes && customer.codes.length > 0) {
-          customer.codes.forEach(code => {
-            const codeType = code.type || 'percentage';
-            const codeAmount = code.amount !== undefined ? code.amount : (code.percentage !== undefined ? code.percentage : 0);
-            let baseSurcharge;
-            if (codeType === 'flat') {
-              baseSurcharge = codeAmount;
-            } else {
-              baseSurcharge = adjustedServiceCost * (codeAmount / 100);
-            }
-            // Apply factor to tax codes
-            totalSurcharge += baseSurcharge * factor;
-          });
-        }
-
-        // Calculate subtotal: adjusted service cost + tax codes (both affected by factor)
-        const subtotalBeforePuc = adjustedServiceCost + totalSurcharge;
-
-        // Calculate PUC Surcharge (applied to subtotal, NOT affected by factor)
-        let pucSurchargeAmount = 0;
-        if (pucSurcharge > 0) {
-          pucSurchargeAmount = subtotalBeforePuc * (pucSurcharge / 100);
-        }
-
-        const totalAmount = hasPaidEarly ? 0 : (subtotalBeforePuc + pastDue + lateFeeAmount + pucSurchargeAmount);
+        const totalAmount = Math.max(0, calcRow.total);
 
         row.innerHTML = `
           <td class="px-6 py-4 whitespace-nowrap text-center">
@@ -10410,13 +10941,13 @@
         const togglesSettings = await loadTogglesSettings();
         if (togglesSettings && togglesSettings.testDate) {
           testDate = togglesSettings.testDate;
-          console.log('[updateSettingsDrawersTable] Loaded testDate from Firestore:', testDate);
+
         } else {
           testDate = null;
-          console.log('[updateSettingsDrawersTable] No testDate in Firestore, using real current date');
+
         }
       } catch (error) {
-        console.error('[updateSettingsDrawersTable] Error loading testDate:', error);
+
       }
 
       // Load payment processing sessions if not already loaded (for EOD status check)
@@ -10424,7 +10955,7 @@
         try {
           await loadPaymentProcessingSessionsFromFirestore();
         } catch (error) {
-          console.error('[updateSettingsDrawersTable] Error loading payment processing sessions:', error);
+
         }
       }
 
@@ -10432,12 +10963,6 @@
       // IMPORTANT: testDate is now loaded above, so getCurrentDate() will use the same date
       const today = window.getCurrentDate();
       const todayStr = today.toISOString().split('T')[0]; // YYYY-MM-DD format
-      
-      console.log('[updateSettingsDrawersTable] ========== EOD STATUS CHECK ==========');
-      console.log('[updateSettingsDrawersTable] testDate variable:', testDate);
-      console.log('[updateSettingsDrawersTable] getCurrentDate() returned:', today.toISOString());
-      console.log('[updateSettingsDrawersTable] Today string:', todayStr);
-      console.log('[updateSettingsDrawersTable] Using EXACT same logic as supervisor EOD screen');
 
       // Use EXACT same logic as supervisor screen:
       // 1. Find all sessions that were SUBMITTED today (not verifiedAt)
@@ -10447,38 +10972,26 @@
         // First get sessions submitted today (same as supervisor screen line 11915-11921)
         const sessionsForTodayRaw = (window.paymentProcessingSessions || []).filter(session => {
           if (!session.submittedAt) {
-            console.log('[updateSettingsDrawersTable] Session', session.id, 'has no submittedAt, skipping');
+
             return false;
           }
           const submittedDate = new Date(session.submittedAt);
           const submittedDateStr = submittedDate.toISOString().split('T')[0];
           const matches = submittedDateStr === todayStr;
-          console.log('[updateSettingsDrawersTable] Session', session.id, 'submittedAt:', session.submittedAt, 'submittedDateStr:', submittedDateStr, 'matches today:', matches);
+
           return matches;
         });
-
-        console.log('[updateSettingsDrawersTable] Sessions submitted today:', sessionsForTodayRaw.length);
-        console.log('[updateSettingsDrawersTable] Sessions submitted today:', sessionsForTodayRaw.map(s => ({
-          id: s.id,
-          drawerId: s.drawer?.id,
-          drawerName: s.drawer?.name,
-          submittedAt: s.submittedAt,
-          verifiedAt: s.verifiedAt,
-          verifiedBy: s.verifiedBy
-        })));
 
         // Filter out sessions that reference drawers that no longer exist (same as supervisor screen line 11924-11925)
         const drawerIdSet = new Set((drawers || []).map(d => d.id));
         sessionsForToday = sessionsForTodayRaw.filter(session => {
           const hasValidDrawer = session.drawer?.id && drawerIdSet.has(session.drawer.id);
           if (!hasValidDrawer) {
-            console.log('[updateSettingsDrawersTable] Session', session.id, 'has invalid drawer, skipping');
+
           }
           return hasValidDrawer;
         });
 
-        console.log('[updateSettingsDrawersTable] Sessions with valid drawers:', sessionsForToday.length);
-        console.log('[updateSettingsDrawersTable] ========== END EOD STATUS CHECK ==========');
       } catch (error) {
 
       }
@@ -10537,11 +11050,9 @@
         const drawerSessions = sessionsForToday.filter(session => 
           session.drawer && session.drawer.id === drawer.id
         );
-        
+
         const lastSodTime = drawer.lastCountDate ? new Date(drawer.lastCountDate).getTime() : 0;
-        
-        console.log(`[updateSettingsDrawersTable] Drawer ${drawer.name} (${drawer.id}): Found ${drawerSessions.length} sessions submitted today, lastSodTime=${drawer.lastCountDate || 'none'}`);
-        
+
         // Check if any of these sessions are verified AND verified AFTER last SOD (this cycle)
         let eodVerifiedToday = false;
         drawerSessions.forEach(session => {
@@ -10549,14 +11060,12 @@
           const verifiedTime = session.verifiedAt ? new Date(session.verifiedAt).getTime() : 0;
           const verifiedAfterSod = lastSodTime > 0 ? verifiedTime >= lastSodTime : isVerified;
           const countsAsVerified = isVerified && verifiedAfterSod;
-          console.log(`[updateSettingsDrawersTable] Drawer ${drawer.name} session ${session.id}: verifiedAt=${session.verifiedAt}, verifiedBy=${session.verifiedBy}, isVerified=${isVerified}, verifiedAfterSod=${verifiedAfterSod}, countsAsVerified=${countsAsVerified}`);
+
           if (countsAsVerified) {
             eodVerifiedToday = true;
           }
         });
-        
-        console.log(`[updateSettingsDrawersTable] Drawer ${drawer.name} EOD status: ${eodVerifiedToday ? 'VERIFIED' : 'NOT VERIFIED'}`);
-        
+
         const eodStatusBadge = eodVerifiedToday ? 
           '<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">Verified</span>' :
           '<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-800">Not Verified</span>';
@@ -14482,18 +14991,8 @@
       const resultsHtml = results.map(customer => {
         const calc = calculateCustomerTotal(customer);
         const totalAmount = Math.max(0, calc.total);
-        const statusClass = customer.paymentStatus === 'overdue' 
-          ? 'bg-red-100 text-red-800' 
-          : customer.paymentStatus === 'inactive'
-          ? 'bg-gray-100 text-gray-800'
-          : customer.paymentStatus === 'pending closing'
-          ? 'bg-yellow-100 text-yellow-800'
-          : 'bg-green-100 text-green-800';
-
-        const daysLate = typeof getCustomerDaysLate === 'function' ? getCustomerDaysLate(customer) : 0;
-        const statusLabel = customer.paymentStatus === 'overdue' && daysLate > 0
-          ? `${customer.paymentStatus.charAt(0).toUpperCase() + customer.paymentStatus.slice(1)} (${daysLate} days late)`
-          : customer.paymentStatus.charAt(0).toUpperCase() + customer.paymentStatus.slice(1);
+        const statusClass = getPaymentStatusBadgeClass(customer);
+        const statusLabel = getPaymentStatusBadgeLabel(customer);
 
         return `
           <div class="p-4 border border-slate-200 dark:border-slate-600 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-700">
@@ -14625,24 +15124,8 @@
         newClientData: newClientData
       };
 
-      // Calculate actual amount due (same logic as in table)
-      const now = new Date();
-      const lastDayOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0);
-      const dueDateStr = (lastDayOfMonth.getMonth() + 1).toString().padStart(2, '0') + '/' + 
-                        lastDayOfMonth.getDate().toString().padStart(2, '0') + '/' + 
-                        lastDayOfMonth.getFullYear();
-
-      // Check if customer has paid early (before due date)
-      const hasPaidEarly = currentResident.lastPayment && currentResident.lastPayment !== 'Never' && 
-                          currentResident.lastPayment.includes('/') && 
-                          new Date(currentResident.lastPayment) < new Date(dueDateStr);
-
-      // Calculate actual amount based on breakdown logic
-      const baseServiceCost = calculateProratedServiceCost(currentResident);
-      const factor = currentResident.factor ? parseFloat(currentResident.factor) : 1.0;
-      const adjustedServiceCost = baseServiceCost * factor;
-      const lateFeeAmount = currentResident.pastDue > 0 ? lateFee : 0; // Late fee
-      const totalAmount = hasPaidEarly ? 0 : (adjustedServiceCost + lateFeeAmount);
+      // Same total as Amount Breakdown / customer tables
+      const totalAmount = Math.max(0, calculateCustomerTotal(currentResident).total);
 
       // Populate the modal
       document.getElementById('transferWarningName').textContent = currentResident.name;
@@ -14745,24 +15228,8 @@
         // Update current resident's location and status
         currentResident.address = newLocation;
 
-        // Calculate actual balance to determine status
-        const now = new Date();
-        const lastDayOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0);
-        const dueDateStr = (lastDayOfMonth.getMonth() + 1).toString().padStart(2, '0') + '/' + 
-                          lastDayOfMonth.getDate().toString().padStart(2, '0') + '/' + 
-                          lastDayOfMonth.getFullYear();
-
-        // Check if customer has paid early
-        const hasPaidEarly = currentResident.lastPayment && currentResident.lastPayment !== 'Never' && 
-                            currentResident.lastPayment.includes('/') && 
-                            new Date(currentResident.lastPayment) < new Date(dueDateStr);
-
-        // Calculate actual amount due
-        const baseServiceCost = calculateProratedServiceCost(currentResident);
-        const factor = currentResident.factor ? parseFloat(currentResident.factor) : 1.0;
-        const adjustedServiceCost = baseServiceCost * factor;
-        const lateFeeAmount = currentResident.pastDue > 0 ? lateFee : 0;
-        const totalAmount = hasPaidEarly ? 0 : (adjustedServiceCost + lateFeeAmount);
+        // Same total as Amount Breakdown / customer tables
+        const totalAmount = Math.max(0, calculateCustomerTotal(currentResident).total);
 
         // Set status based on balance: inactive if balance is 0, pending closing if they owe money
         if (totalAmount === 0) {
@@ -15248,15 +15715,54 @@
       }
     }
 
+    // Sync late fee form labels when switching flat vs percent (before save)
+    window.syncLateFeeModeLabels = function() {
+      const flatEl = document.getElementById('lateFeeModeFlat');
+      const label = document.getElementById('lateFeeInputLabel');
+      const input = document.getElementById('lateFeeInput');
+      const isPercent = flatEl && !flatEl.checked;
+      if (label) {
+        label.textContent = isPercent ? 'Percent (%)' : 'Amount ($)';
+      }
+      if (input) {
+        input.placeholder = isPercent ? '5.00' : '20.00';
+        if (isPercent) {
+          input.setAttribute('max', '100');
+        } else {
+          input.removeAttribute('max');
+        }
+      }
+    };
+
+    function getLateFeeStatusSummary() {
+      if (lateFeeMode === 'percent') {
+        return `Current value: ${lateFee.toFixed(2)}% of amount due (before late fees)`;
+      }
+      return `Current value: $${lateFee.toFixed(2)} per 30‑day late period`;
+    }
+
     // Update late fee display
     function updateLateFeeDisplay() {
       const input = document.getElementById('lateFeeInput');
       const status = document.getElementById('lateFeeStatus');
+      const flatEl = document.getElementById('lateFeeModeFlat');
+      const pctEl = document.getElementById('lateFeeModePercent');
+      if (flatEl && pctEl) {
+        if (lateFeeMode === 'percent') {
+          pctEl.checked = true;
+          flatEl.checked = false;
+        } else {
+          flatEl.checked = true;
+          pctEl.checked = false;
+        }
+      }
+      syncLateFeeModeLabels();
       if (input) {
         input.value = lateFee.toFixed(2);
       }
       if (status) {
-        status.textContent = `Current value: $${lateFee.toFixed(2)}`;
+        status.textContent = getLateFeeStatusSummary();
+        status.className = 'text-xs text-slate-500 dark:text-slate-400';
       }
     }
 
@@ -15276,21 +15782,33 @@
     window.saveLateFee = async function() {
       const input = document.getElementById('lateFeeInput');
       const status = document.getElementById('lateFeeStatus');
+      const pctEl = document.getElementById('lateFeeModePercent');
 
       if (!input) return;
 
+      const newMode = pctEl && pctEl.checked ? 'percent' : 'flat';
       const newValue = parseFloat(input.value);
 
       if (isNaN(newValue) || newValue < 0) {
         if (status) {
-          status.textContent = 'Please enter a valid amount (must be 0 or greater)';
+          status.textContent = 'Please enter a valid value (must be 0 or greater)';
+          status.className = 'text-xs text-red-500 dark:text-red-400';
+        }
+        return;
+      }
+
+      if (newMode === 'percent' && newValue > 100) {
+        if (status) {
+          status.textContent = 'Percent cannot exceed 100';
           status.className = 'text-xs text-red-500 dark:text-red-400';
         }
         return;
       }
 
       const oldValue = lateFee;
+      const oldMode = lateFeeMode;
       lateFee = newValue;
+      lateFeeMode = newMode;
 
       try {
         await saveLateFeeToFirestore();
@@ -15299,16 +15817,22 @@
           status.className = 'text-xs text-green-500 dark:text-green-400';
         }
 
+        updateCustomerTable();
+        if (typeof updateSettingsCustomerTable === 'function') {
+          updateSettingsCustomerTable();
+        }
+
         // Clear status message after 3 seconds
         setTimeout(() => {
           if (status) {
-            status.textContent = `Current value: $${lateFee.toFixed(2)}`;
+            status.textContent = getLateFeeStatusSummary();
             status.className = 'text-xs text-slate-500 dark:text-slate-400';
           }
         }, 3000);
       } catch (error) {
 
         lateFee = oldValue; // Revert on error
+        lateFeeMode = oldMode;
         if (status) {
           status.textContent = 'Error saving late fee. Please try again.';
           status.className = 'text-xs text-red-500 dark:text-red-400';
@@ -16326,6 +16850,45 @@
       }
     };
 
+    /**
+     * Resolve past-due dollars from an import row.
+     * Order: PrevBal → "Past Due" column → PastDue as dollar if > 1 → PastDue flag (1/Y) + PrevAmt when PrevBal empty.
+     * Many spreadsheets use PastDue=1 as a flag and put the amount in PrevAmt.
+     */
+    function resolvePastDueFromImportRow(rowData) {
+      if (!rowData || typeof rowData !== 'object') return 0;
+      let pastDue = 0;
+      const prevBal = rowData['PrevBal'];
+      const pastDueAmount = rowData['Past Due'];
+      const pastDueFlag = rowData['PastDue'];
+      const prevAmt = rowData['PrevAmt'];
+      const acct = rowData['AcctNum'] || rowData['accountNumber'] || '';
+
+      if (prevBal !== undefined && prevBal !== null && String(prevBal).trim() !== '') {
+        const parsed = parseFloat(prevBal);
+        if (!isNaN(parsed)) pastDue = parsed;
+      } else if (pastDueAmount !== undefined && pastDueAmount !== null && String(pastDueAmount).trim() !== '') {
+        const parsed = parseFloat(pastDueAmount);
+        if (!isNaN(parsed)) pastDue = parsed;
+      } else if (pastDueFlag !== undefined && pastDueFlag !== null && String(pastDueFlag).trim() !== '') {
+        const parsed = parseFloat(pastDueFlag);
+        if (!isNaN(parsed) && parsed > 1) {
+          pastDue = parsed;
+        } else if (
+          (!isNaN(parsed) && parsed === 1) ||
+          String(pastDueFlag).trim() === '1' ||
+          String(pastDueFlag).toLowerCase() === 'y'
+        ) {
+          const pa = parseFloat(prevAmt);
+          if (!isNaN(pa) && pa > 0) {
+            pastDue = pa;
+            console.log('[LateLogic] pastDue from PastDue flag + PrevAmt:', acct, '$' + pastDue.toFixed(2));
+          }
+        }
+      }
+      return pastDue;
+    }
+
     // Re-sync pastDue amounts from stored importData
     window.syncPastDueFromImportData = async function() {
       if (!confirm('This will update all customers\' past due amounts from their imported Excel data. Continue?')) {
@@ -16342,31 +16905,7 @@
 
         try {
           const rowData = customer.importData;
-
-          // Use the same logic as import to extract pastDue
-          let pastDue = 0;
-          const prevBal = rowData['PrevBal'];
-          const pastDueAmount = rowData['Past Due'];
-          const pastDueFlag = rowData['PastDue'];
-
-          // Prioritize PrevBal (actual dollar amount)
-          if (prevBal !== undefined && prevBal !== null && prevBal !== '') {
-            const parsed = parseFloat(prevBal);
-            if (!isNaN(parsed)) {
-              pastDue = parsed;
-            }
-          } else if (pastDueAmount !== undefined && pastDueAmount !== null && pastDueAmount !== '') {
-            const parsed = parseFloat(pastDueAmount);
-            if (!isNaN(parsed)) {
-              pastDue = parsed;
-            }
-          } else if (pastDueFlag !== undefined && pastDueFlag !== null && pastDueFlag !== '') {
-            // Only use PastDue flag if it looks like a dollar amount (not just 1 or 0)
-            const parsed = parseFloat(pastDueFlag);
-            if (!isNaN(parsed) && parsed > 1) {
-              pastDue = parsed;
-            }
-          }
+          const pastDue = resolvePastDueFromImportRow(rowData);
 
           // Update customer's pastDue
           customer.pastDue = pastDue;
@@ -16398,8 +16937,8 @@
       updateSettingsCustomerTable();
       updateDashboard();
 
-      // Save only this customer to Firestore
-      await saveSingleCustomerToFirestore(customer);
+      console.log('[LateLogic] syncPastDueFromImportData: saving all customers to Firestore…');
+      await saveCustomersToFirestore();
 
       alert(`Sync complete! Updated ${updated} customers. ${errors > 0 ? errors + ' errors occurred.' : ''}`);
     };
@@ -16506,6 +17045,159 @@
     };
 
     // Reset all payment history (clear paymentHistory and set lastPayment to 'Never')
+
+    /**
+     * After other fresh-start resets: record a full payment of current-cycle charges on the test date,
+     * set payment buckets so Total Due is $0, and add a paymentHistory row for audit / Amount Breakdown.
+     */
+    function applyTestFreshStartFullPayForCustomer(customer) {
+      if (!customer) return;
+      const today = window.getCurrentDate ? window.getCurrentDate() : new Date();
+      const payDateStr = (today.getMonth() + 1).toString().padStart(2, '0') + '/' +
+        today.getDate().toString().padStart(2, '0') + '/' + today.getFullYear();
+      const timestamp = today.toISOString();
+
+      const calc = calculateCustomerTotal(customer);
+      const totalDue = Math.round(Math.max(0, calc.total) * 100) / 100;
+
+      if (totalDue <= 0.005) {
+        customer.lastPayment = 'Never';
+        return;
+      }
+
+      const sewer = Math.round((calc.adjustedServiceCost || 0) * 100) / 100;
+      const taxAndPuc = Math.round(((calc.totalSurcharge || 0) + (calc.pucSurchargeAmount || 0)) * 100) / 100;
+      const late = Math.round((calc.lateFeeAmount || 0) * 100) / 100;
+
+      customer.currentMonthPaidSewer = sewer;
+      customer.currentMonthPaidTaxCodes = taxAndPuc;
+      customer.currentMonthPaidLateFee = late;
+      customer.currentMonthPaid = Math.round((sewer + taxAndPuc + late) * 100) / 100;
+
+      customer.paymentHistory = [{
+        date: payDateStr,
+        timestamp: timestamp,
+        amountDue: totalDue,
+        amountPaid: totalDue,
+        creditGiven: null,
+        paymentMethod: 'Fresh start (full pay)',
+        source: 'testFreshStart'
+      }];
+      customer.lastPayment = payDateStr;
+      customer.lastPrintedStatementTotalDue = totalDue;
+    }
+
+    /**
+     * Test 30-60-90: set test date to real today, reset deposits to $1,000, past due to $0,
+     * clear bill print & 60-day flags, clear POS sessions, then simulate full pay of current charges today.
+     */
+    window.test306090FreshStart = async function() {
+      if (!confirm(
+        'This will:\n\n' +
+        '• Set the TEST DATE to today (real calendar date)\n' +
+        '• Set every customer deposit to $1,000\n' +
+        '• Set every customer past due to $0\n' +
+        '• Clear bill print dates (30/60/90 timers start fresh)\n' +
+        '• Clear payment processing sessions\n' +
+        '• Record a full payment TODAY for each customer’s current charges (Total Due → $0)\n' +
+        '  and fill Last payment / Last amount due on the Amount Breakdown\n\n' +
+        'This cannot be undone. Continue?'
+      )) {
+        return;
+      }
+
+      const real = new Date();
+      const y = real.getFullYear();
+      const m = String(real.getMonth() + 1).padStart(2, '0');
+      const d = String(real.getDate()).padStart(2, '0');
+      const todayStr = `${y}-${m}-${d}`;
+
+      const testDateInput = document.getElementById('testDateInput');
+      if (testDateInput) {
+        testDateInput.value = todayStr;
+      }
+      await window.setTestDate(todayStr);
+
+      if (typeof window.clearPaymentProcessingSession === 'function') {
+        window.clearPaymentProcessingSession('test306090FreshStart');
+      } else {
+        window.currentPaymentProcessing = null;
+        try {
+          localStorage.removeItem('currentPaymentProcessingSession');
+          localStorage.removeItem('currentPaymentProcessing');
+          localStorage.setItem('paymentProcessingResetAt', new Date().toISOString());
+        } catch (e) { /* ignore */ }
+        if (typeof renderPaymentProcessingPreview === 'function') {
+          renderPaymentProcessingPreview();
+        }
+      }
+      if (Array.isArray(window.paymentProcessingSessions)) {
+        window.paymentProcessingSessions = [];
+      }
+      if (typeof renderPaymentProcessingSessionsList === 'function') {
+        renderPaymentProcessingSessionsList();
+      }
+
+      try {
+        const sessionsRef = collection(db, 'paymentProcessingSessions');
+        const snapshot = await getDocs(sessionsRef);
+        const deletePromises = [];
+        snapshot.forEach(docSnap => {
+          deletePromises.push(deleteDoc(doc(sessionsRef, docSnap.id)));
+        });
+        await Promise.all(deletePromises);
+      } catch (error) { /* ignore */ }
+
+      let updated = 0;
+      customers.forEach(customer => {
+        try {
+          customer.deposit = 1000;
+          customer.pastDue = 0;
+          customer.paymentHistory = [];
+          customer.lastPayment = 'Never';
+          customer.currentMonthPaid = 0;
+          customer.currentMonthPaidSewer = 0;
+          customer.currentMonthPaidTaxCodes = 0;
+          customer.currentMonthPaidLateFee = 0;
+          customer.currentMonthPaymentHistory = [];
+          delete customer.lastBillPrintDate;
+          delete customer.lastPrintedStatementTotalDue;
+          customer.lastBill60DayDepositApplied = false;
+          delete customer.daysLate;
+
+          // Pay current-cycle charges in full on the (test) “today” so breakdown shows paid + $0 due
+          applyTestFreshStartFullPayForCustomer(customer);
+
+          updateCustomerPaymentStatus(customer);
+          // Fresh start = test ledger: everyone who isn't manually inactive/pending should read as Current
+          if (!isCustomerManualLifecycleStatus(customer)) {
+            customer.paymentStatus = 'current';
+          }
+          updated++;
+        } catch (e) {
+          console.error('test306090FreshStart customer error', customer?.id, e);
+        }
+      });
+
+      filteredCustomers = [...customers];
+      updateCustomerTable();
+      updateSettingsCustomerTable();
+      updateDashboard();
+
+      await saveCustomersToFirestore();
+
+      if (typeof loadPaymentProcessingSessionsFromFirestore === 'function') {
+        await loadPaymentProcessingSessionsFromFirestore();
+      }
+
+      alert(
+        `Test 30-60-90 fresh start complete.\n\n` +
+        `Test date: ${todayStr}\n` +
+        `Updated ${updated} customer(s).\n\n` +
+        `Each account has a simulated “full pay” of current charges dated today (see Amount Breakdown).`
+      );
+    };
+
     window.resetPayments = async function() {
 
       if (!confirm('This will reset all customers who have past payments so the data looks like they never paid any past payments. This will clear all payment history and reset lastPayment to "Never". This will also clear the current payment processing session. This action cannot be undone. Continue?')) {
@@ -16847,32 +17539,7 @@
 
                 // Get amounts
                 const totalDue = parseFloat(rowData['TotalDue'] || rowData['CurrDue'] || rowData['Current Bill'] || rowData['Amount Due'] || 0) || 0;
-                // Handle PrevBal first (actual amount), then Past Due (amount), then PastDue (flag - ignore if it's just 1/0)
-                // If PrevBal is empty/blank, treat as 0. Only use PastDue flag if it's actually a dollar amount
-                let pastDue = 0;
-                const prevBal = rowData['PrevBal'];
-                const pastDueAmount = rowData['Past Due'];
-                const pastDueFlag = rowData['PastDue'];
-
-                // Prioritize PrevBal (actual dollar amount)
-                if (prevBal !== undefined && prevBal !== null && prevBal !== '') {
-                  const parsed = parseFloat(prevBal);
-                  if (!isNaN(parsed)) {
-                    pastDue = parsed;
-                  }
-                } else if (pastDueAmount !== undefined && pastDueAmount !== null && pastDueAmount !== '') {
-                  const parsed = parseFloat(pastDueAmount);
-                  if (!isNaN(parsed)) {
-                    pastDue = parsed;
-                  }
-                } else if (pastDueFlag !== undefined && pastDueFlag !== null && pastDueFlag !== '') {
-                  // Only use PastDue flag if it looks like a dollar amount (not just 1 or 0)
-                  const parsed = parseFloat(pastDueFlag);
-                  if (!isNaN(parsed) && parsed > 1) {
-                    pastDue = parsed;
-                  }
-                  // If it's 1 or 0, treat as flag and ignore (pastDue stays 0)
-                }
+                const pastDue = resolvePastDueFromImportRow(rowData);
 
                 if (customer) {
                   // Update existing customer - preserve existing fields, add/update importData
@@ -17297,6 +17964,7 @@
             required
           >
             <option value="current" ${currentValue === 'current' ? 'selected' : ''}>Current</option>
+            <option value="late" ${currentValue === 'late' ? 'selected' : ''}>Late</option>
             <option value="overdue" ${currentValue === 'overdue' ? 'selected' : ''}>Overdue</option>
             <option value="inactive" ${currentValue === 'inactive' ? 'selected' : ''}>Inactive</option>
             <option value="pending closing" ${currentValue === 'pending closing' ? 'selected' : ''}>Pending Closing</option>
@@ -17668,6 +18336,23 @@
             `;
             lateFeeDetailsEl.appendChild(baseRow);
 
+            // Explain 30/60/90 cycles so deposit at 31+ days past due doesn’t look like “double late fee”
+            const calLateLbl = getCalendarDaysLateAfterGrace(customer, 20);
+            const feeCycles = getLateFeeCycleCount(calLateLbl);
+            if (autoApplyLateFees && feeCycles > 0) {
+              const hint = document.createElement('div');
+              hint.className = 'text-xs text-slate-500 dark:text-slate-400 py-1';
+              if (lateFeeMode === 'flat') {
+                hint.textContent =
+                  `${feeCycles} late-fee cycle${feeCycles === 1 ? '' : 's'} (adds every 30 calendar days past the due date, max 3). ` +
+                  `Per cycle: $${Number(lateFee).toFixed(2)} → total late fee $${(calc.lateFeeAmount || 0).toFixed(2)}.`;
+              } else {
+                hint.textContent =
+                  `${feeCycles} late-fee cycle${feeCycles === 1 ? '' : 's'} (percent mode: % applies to balance before late fees, max 3 cycles).`;
+              }
+              lateFeeDetailsEl.appendChild(hint);
+            }
+
             const lfPays = paymentsByCategory('Late Fee');
             lfPays.forEach((p) => {
               const paymentNum = p.paymentNumber || '?';
@@ -17718,15 +18403,13 @@
         }
       }
 
-      // Calculate due date as last day of current month
-      const now = new Date();
-      const lastDayOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0);
-      const dueDateStr = (lastDayOfMonth.getMonth() + 1).toString().padStart(2, '0') + '/' + 
-                        lastDayOfMonth.getDate().toString().padStart(2, '0') + '/' + 
-                        lastDayOfMonth.getFullYear();
+      // Due date is bill print date + 20-day grace (day 21 is first late day)
+      const dueDateObj = getBillDueDateObj(customer, 20);
+      const dueDateStr = formatDateMMDDYYYY(dueDateObj);
 
       // Calculate billing cycle (month after due date)
-      const billingCycleStart = new Date(lastDayOfMonth.getFullYear(), lastDayOfMonth.getMonth() + 1, 1);
+      // If due date is in March, billing cycle is April.
+      const billingCycleStart = new Date(dueDateObj.getFullYear(), dueDateObj.getMonth() + 1, 1);
       const billingCycleEnd = new Date(billingCycleStart.getFullYear(), billingCycleStart.getMonth() + 1, 0);
 
       const formatShortDate = (date) => {
@@ -17863,36 +18546,35 @@
       document.getElementById('amountDetailsTotal').textContent = `$${clampedTotal.toFixed(2)}`;
       document.getElementById('amountDetailsDueDate').textContent = dueDateStr;
       document.getElementById('amountDetailsBillingCycle').textContent = billingCycleStr;
-      document.getElementById('amountDetailsLastPayment').textContent = formatDate(customer.lastPayment);
 
-      // Get last payment amount from payment history
+      const latestPayment = typeof getLatestPaymentHistoryEntry === 'function'
+        ? getLatestPaymentHistoryEntry(customer)
+        : null;
+      document.getElementById('amountDetailsLastPayment').textContent = latestPayment && latestPayment.date
+        ? formatDate(latestPayment.date)
+        : formatDate(customer.lastPayment);
 
       let lastPaymentAmount = '$0.00';
-      if (customer.paymentHistory && Array.isArray(customer.paymentHistory) && customer.paymentHistory.length > 0) {
-        // Get the most recent payment (assuming they're ordered by date, or get the last one)
-        const lastPayment = customer.paymentHistory[customer.paymentHistory.length - 1];
-
-        if (lastPayment && lastPayment.amountPaid) {
-          const amountPaid = parseFloat(lastPayment.amountPaid);
-
+      if (latestPayment && latestPayment.amountPaid != null && latestPayment.amountPaid !== '') {
+        const amountPaid = parseFloat(latestPayment.amountPaid);
+        if (!isNaN(amountPaid)) {
           lastPaymentAmount = `$${amountPaid.toFixed(2)}`;
-
-        } else {
-
         }
-      } else {
-
       }
 
       document.getElementById('amountDetailsLastPaymentAmount').textContent = lastPaymentAmount;
 
-      // Get last amount due from payment history
+      // Last amount due: balance that the most recent payment was applied against; else last PDF snapshot
       let lastAmountDue = '$0.00';
-      if (customer.paymentHistory && Array.isArray(customer.paymentHistory) && customer.paymentHistory.length > 0) {
-        const lastPayment = customer.paymentHistory[customer.paymentHistory.length - 1];
-        if (lastPayment && lastPayment.amountDue) {
-          const amountDue = parseFloat(lastPayment.amountDue);
+      if (latestPayment && latestPayment.amountDue != null && latestPayment.amountDue !== '') {
+        const amountDue = parseFloat(latestPayment.amountDue);
+        if (!isNaN(amountDue)) {
           lastAmountDue = `$${amountDue.toFixed(2)}`;
+        }
+      } else if (customer.lastPrintedStatementTotalDue != null && customer.lastPrintedStatementTotalDue !== '') {
+        const lp = parseFloat(customer.lastPrintedStatementTotalDue);
+        if (!isNaN(lp)) {
+          lastAmountDue = `$${lp.toFixed(2)}`;
         }
       }
       const lastAmountDueEl = document.getElementById('amountDetailsLastAmountDue');
@@ -17970,7 +18652,7 @@
 
       let paymentsHtml = '';
       if (sortedPayments.length === 0) {
-        paymentsHtml = '<tr><td colspan="4" class="text-center text-slate-500 dark:text-slate-400 py-8">No payment history available</td></tr>';
+        paymentsHtml = '<tr><td colspan="5" class="text-center text-slate-500 dark:text-slate-400 py-8">No payment history available</td></tr>';
       } else {
         sortedPayments.forEach((payment, index) => {
           // Parse date and add time if available
@@ -17993,12 +18675,14 @@
           }
 
           const creditGiven = payment.creditGiven || 0;
+          const methodLabel = payment.paymentMethod || (payment.source === 'depositAutoApply' ? 'Security deposit (auto)' : '—');
           paymentsHtml += `
             <tr class="border-b border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800">
               <td class="px-6 py-4 whitespace-nowrap text-sm text-slate-900 dark:text-slate-100">${dateTimeDisplay}</td>
               <td class="px-6 py-4 whitespace-nowrap text-sm text-slate-900 dark:text-slate-100">$${(payment.amountDue || 0).toFixed(2)}</td>
               <td class="px-6 py-4 whitespace-nowrap text-sm text-slate-900 dark:text-slate-100">$${(payment.amountPaid || 0).toFixed(2)}</td>
               <td class="px-6 py-4 whitespace-nowrap text-sm ${creditGiven > 0 ? 'text-green-600 dark:text-green-400' : 'text-slate-500 dark:text-slate-400'}">${creditGiven > 0 ? `$${creditGiven.toFixed(2)}` : '—'}</td>
+              <td class="px-6 py-4 whitespace-nowrap text-sm text-slate-600 dark:text-slate-300">${methodLabel}</td>
             </tr>
           `;
         });
@@ -18027,6 +18711,7 @@
                   <th class="px-6 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-300 uppercase tracking-wider">Amount Due</th>
                   <th class="px-6 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-300 uppercase tracking-wider">Amount Paid</th>
                   <th class="px-6 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-300 uppercase tracking-wider">Credit Given</th>
+                  <th class="px-6 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-300 uppercase tracking-wider">Method</th>
                 </tr>
               </thead>
               <tbody class="bg-white dark:bg-slate-800 divide-y divide-slate-200 dark:divide-slate-700">
@@ -18067,6 +18752,33 @@
         return new Date(year, month, day);
       }
       return null;
+    }
+
+    /**
+     * Latest payment row by timestamp or payment date (POS + deposit auto-apply).
+     * Used for Amount Breakdown "Last payment" / "Last amount due".
+     */
+    function getLatestPaymentHistoryEntry(customer) {
+      const hist = customer && customer.paymentHistory;
+      if (!Array.isArray(hist) || hist.length === 0) return null;
+      let best = hist[hist.length - 1];
+      let bestTime = -Infinity;
+      hist.forEach((p) => {
+        if (!p) return;
+        let t = NaN;
+        if (p.timestamp) {
+          t = new Date(p.timestamp).getTime();
+        }
+        if (isNaN(t) && p.date) {
+          const d = parsePaymentDate(p.date);
+          t = d && !isNaN(d.getTime()) ? d.getTime() : NaN;
+        }
+        if (!isNaN(t) && t >= bestTime) {
+          bestTime = t;
+          best = p;
+        }
+      });
+      return best;
     }
 
     // Toggle Tax Codes details inside Amount Breakdown
@@ -18188,8 +18900,22 @@
 
           <div>
             <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">Deposit Amount</label>
-            <div class="w-full px-4 py-3 rounded-xl border border-slate-300 dark:border-slate-600 bg-slate-50 dark:bg-slate-700 text-slate-800 dark:text-slate-200">
-              $${(customer.deposit || 1000.00).toFixed(2)}
+            <div class="flex items-center gap-3">
+              <input
+                type="number"
+                step="0.01"
+                min="0"
+                id="customerDepositInput_${customer.id}"
+                value="${customer.deposit ?? ''}"
+                placeholder="Enter deposit amount"
+                class="flex-1 px-4 py-3 rounded-xl border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-700 text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              <button
+                onclick="saveCustomerDeposit('${customer.id}')"
+                class="bg-blue-600 text-white px-4 py-3 rounded-xl hover:bg-blue-700 transition-colors font-medium whitespace-nowrap"
+              >
+                Save
+              </button>
             </div>
           </div>
 
@@ -18447,6 +19173,65 @@
       }
     };
 
+    // Save customer deposit (used by the 60-day late bucket rule)
+    window.saveCustomerDeposit = async function(customerId) {
+      const customer = customers.find(c => c.id === customerId);
+      if (!customer) {
+        alert('Customer not found');
+        return;
+      }
+
+      const input = document.getElementById(`customerDepositInput_${customerId}`);
+      if (!input) {
+        alert('Deposit input not found');
+        return;
+      }
+
+      const raw = input.value.trim();
+      const parsed = raw === '' ? 0 : parseFloat(raw);
+      if (isNaN(parsed) || parsed < 0) {
+        alert('Please enter a valid deposit amount (must be 0 or greater)');
+        input.value = customer.deposit ?? '';
+        return;
+      }
+
+      try {
+        customer.deposit = parsed;
+        // Reset deposit application flag when deposit changes (so we can re-test)
+        customer.lastBill60DayDepositApplied = false;
+
+        const customersRef = collection(db, 'customers');
+        const customerRef = doc(customersRef, customerId);
+        await setDoc(customerRef, customer);
+
+        // Refresh UI pieces that depend on totals
+        updateCustomerTable();
+        updateSettingsCustomerTable();
+
+        console.log('[LateLogic] saveCustomerDeposit:', {
+          customerId,
+          deposit: customer.deposit,
+          lastBill60DayDepositApplied: customer.lastBill60DayDepositApplied
+        });
+
+        const button = input.nextElementSibling;
+        const originalText = button ? button.textContent : 'Save';
+        if (button) {
+          button.textContent = 'Saved!';
+          button.classList.remove('bg-blue-600', 'hover:bg-blue-700');
+          button.classList.add('bg-green-600');
+          setTimeout(() => {
+            button.textContent = originalText;
+            button.classList.remove('bg-green-600');
+            button.classList.add('bg-blue-600', 'hover:bg-blue-700');
+          }, 2000);
+        }
+      } catch (error) {
+        alert('Error saving deposit: ' + error.message);
+        input.value = customer.deposit ?? '';
+      }
+    };
+
     // Show customer data profile modal (Excel preview)
     window.showCustomerDataProfile = function(customerId) {
       const customer = customers.find(c => c.id === customerId);
@@ -18690,15 +19475,6 @@
       document.getElementById('paymentHistoryModal').classList.add('hidden');
     };
 
-    // Keyboard shortcut: Ctrl+Shift or Cmd+Shift opens settings menu
-    document.addEventListener('keydown', function(event) {
-      if ((event.ctrlKey || event.metaKey) && event.shiftKey) {
-        event.preventDefault();
-        if (typeof window.showSettingsModule === 'function') {
-          window.showSettingsModule();
-        }
-      }
-    });
   </script>
   <style>
     :root { color-scheme: light dark; }
@@ -18740,7 +19516,7 @@
               placeholder="Enter Username"
           >
         </div>
-        
+
         <div>
           <label for="firebasePassword" class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">Password</label>
           <input 
@@ -18752,9 +19528,9 @@
             placeholder="Enter password"
           >
         </div>
-        
+
         <div id="firebaseAuthError" class="text-red-600 dark:text-red-400 text-sm hidden"></div>
-        
+
         <button 
           type="submit" 
           id="firebaseAuthSubmit"
@@ -19526,6 +20302,7 @@
                 <select id="searchByStatus" class="w-full px-4 py-3 border border-slate-300 dark:border-slate-600 rounded-xl focus:ring-2 focus:ring-purple-500 focus:border-transparent bg-white dark:bg-slate-700 text-slate-800 dark:text-slate-200" onchange="performSearch()">
                   <option value="">All Status</option>
                   <option value="current">Current</option>
+                  <option value="late">Late</option>
                   <option value="overdue">Overdue</option>
                   <option value="30days">30 days late</option>
                   <option value="60days">60 days late</option>
@@ -19715,6 +20492,7 @@
                 >
                   <option value="all">All Status</option>
                   <option value="current">Current</option>
+                  <option value="late">Late</option>
                   <option value="overdue">Overdue</option>
                   <option value="no-codes">No codes</option>
                   <option value="has-codes">Has codes</option>
@@ -19846,12 +20624,23 @@
               <div class="flex justify-between items-center mb-4">
                 <div>
                   <h4 class="text-lg font-semibold text-slate-800 dark:text-slate-200">Late Fee</h4>
-                  <p class="text-sm text-slate-500 dark:text-slate-400 mt-1">Set the default late fee charge amount</p>
+                  <p class="text-sm text-slate-500 dark:text-slate-400 mt-1">Flat dollar amount per 30‑day late period (up to 3), or a percent of the amount due before late fees (same cycle rules).</p>
                 </div>
+              </div>
+              <div class="flex flex-wrap items-center gap-4 mb-4">
+                <span class="text-sm font-medium text-slate-700 dark:text-slate-300">Type:</span>
+                <label class="inline-flex items-center gap-2 text-sm text-slate-700 dark:text-slate-300 cursor-pointer">
+                  <input type="radio" name="lateFeeMode" id="lateFeeModeFlat" value="flat" class="rounded-full border-slate-300" onchange="syncLateFeeModeLabels()" />
+                  Flat ($)
+                </label>
+                <label class="inline-flex items-center gap-2 text-sm text-slate-700 dark:text-slate-300 cursor-pointer">
+                  <input type="radio" name="lateFeeMode" id="lateFeeModePercent" value="percent" class="rounded-full border-slate-300" onchange="syncLateFeeModeLabels()" />
+                  Percent of amount due (%)
+                </label>
               </div>
               <div class="flex items-center gap-4">
                 <div class="flex-1">
-                  <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">Amount ($)</label>
+                  <label id="lateFeeInputLabel" class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">Amount ($)</label>
                   <input 
                     type="number" 
                     id="lateFeeInput" 
@@ -20005,11 +20794,13 @@
                       type="date" 
                       id="testDateInput" 
                       class="w-full px-4 py-2 border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      onclick="if (this.showPicker) this.showPicker()"
                       onchange="setTestDate(this.value)"
                     />
                   </div>
                   <div class="flex items-end">
                     <button 
+                      type="button"
                       onclick="clearTestDate()" 
                       class="bg-slate-500 text-white px-4 py-2 rounded-lg hover:bg-slate-600 transition-colors font-medium"
                       title="Clear test date and use real current date"
@@ -20017,10 +20808,35 @@
                       Clear
                     </button>
                   </div>
+                  <div class="flex items-end">
+                    <button 
+                      type="button"
+                      onclick="setTestDate(document.getElementById('testDateInput').value)" 
+                      class="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition-colors font-medium"
+                      title="Save test date"
+                    >
+                      Save
+                    </button>
+                  </div>
                 </div>
                 <p class="text-xs text-slate-500 dark:text-slate-400 mt-2" id="testDateStatus">
                   Using real current date: <span id="currentDateDisplay"></span>
                 </p>
+              </div>
+
+              <div class="bg-indigo-50 dark:bg-indigo-900/20 p-4 rounded-xl border border-indigo-200 dark:border-indigo-700">
+                <h3 class="font-semibold text-indigo-800 dark:text-indigo-200 mb-2">Test 30-60-90</h3>
+                <p class="text-sm text-indigo-600 dark:text-indigo-300 mb-4">
+                  Set the test date to <strong>today</strong>, reset every account&apos;s deposit to <strong>$1,000</strong>, past due to <strong>$0</strong>, clear all payment history and current-month payments, and clear bill-print metadata so you can test 30/60/90-day flows from a clean slate.
+                </p>
+                <button
+                  type="button"
+                  onclick="test306090FreshStart()"
+                  class="bg-indigo-600 text-white px-6 py-3 rounded-lg hover:bg-indigo-700 transition-colors font-medium"
+                  title="Reset test date, deposits, past due, and payments for all customers"
+                >
+                  Fresh start (today + reset all)
+                </button>
               </div>
 
               <div class="bg-blue-50 dark:bg-blue-900/20 p-4 rounded-xl border border-blue-200 dark:border-blue-700">
@@ -20253,6 +21069,26 @@
                     <input 
                       type="checkbox" 
                       id="toggleUserCodePerTransaction" 
+                      class="sr-only peer"
+                      onchange="saveTogglesSettings()"
+                    />
+                    <div class="w-11 h-6 bg-slate-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 dark:peer-focus:ring-blue-800 rounded-full peer dark:bg-slate-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-600 peer-checked:bg-blue-600"></div>
+                  </label>
+                </div>
+              </div>
+
+              <div class="bg-slate-50 dark:bg-slate-900/20 p-6 rounded-xl border border-slate-200 dark:border-slate-700">
+                <div class="flex items-center justify-between">
+                  <div class="flex-1">
+                    <h3 class="text-lg font-semibold text-slate-800 dark:text-slate-200 mb-2">Automatically apply late fees</h3>
+                    <p class="text-sm text-slate-600 dark:text-slate-300">
+                      When enabled, PUBS will automatically apply late fees based on how many days a bill is late (30/60/90 day cycles) using the default Late Fee amount.
+                    </p>
+                  </div>
+                  <label class="relative inline-flex items-center cursor-pointer">
+                    <input 
+                      type="checkbox" 
+                      id="toggleAutoApplyLateFees" 
                       class="sr-only peer"
                       onchange="saveTogglesSettings()"
                     />
@@ -20528,6 +21364,7 @@
             >
               <option value="all">All Status</option>
               <option value="current">Current</option>
+              <option value="late">Late</option>
               <option value="overdue">Overdue</option>
               <option value="no-codes">No codes</option>
               <option value="has-codes">Has codes</option>
