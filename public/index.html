@@ -1159,6 +1159,7 @@
           }
           // Keep global toggle in sync
           autoApplyLateFees = settings.autoApplyLateFees;
+          console.log('[LateLogic] loadTogglesSettings: autoApplyLateFees =', autoApplyLateFees, '(from Firestore settings/toggles)');
 
         } else {
           // If setting doesn't exist, create it with default values
@@ -1174,6 +1175,7 @@
           };
           await setDoc(settingsRef, settings);
           autoApplyLateFees = true;
+          console.log('[LateLogic] loadTogglesSettings: autoApplyLateFees = true (no toggles doc; created defaults)');
         }
 
         // Update checkboxes if they exist
@@ -2991,14 +2993,22 @@
 
     }
 
-    // --- Late tracking: calendar from last bill print + 20-day grace ---
+    // --- Late tracking: calendar from delinquency anchor print + 20-day grace ---
+    // lateFeeAnchorPrintDate = first bill print of the current unpaid streak (set once, kept across rebills).
+    // lastBillPrintDate = latest statement print (due date on PDF still uses this).
     // Owed balance can be prior pastDue OR unpaid current-cycle charges (pastDue may be $0).
 
+    function getLateFeeTrackingPrintDateIso(customer) {
+      if (!customer) return null;
+      return customer.lateFeeAnchorPrintDate || customer.lastBillPrintDate || null;
+    }
+
     function getDaysSinceLastBillPrint(customer) {
-      if (!customer || !customer.lastBillPrintDate) return null;
+      const dateIso = getLateFeeTrackingPrintDateIso(customer);
+      if (!dateIso) return null;
       let billDate;
       try {
-        billDate = new Date(customer.lastBillPrintDate);
+        billDate = new Date(dateIso);
       } catch (e) {
         return null;
       }
@@ -3112,6 +3122,17 @@
     }
 
     /**
+     * Single full-address line for bill PDF (full_address): service street + city, state, zip.
+     * Street uses customer.address (same as account_address); city/state/zip same sources as address_city_state_zip.
+     */
+    function getFullAddressForBill(customer) {
+      if (!customer) return '';
+      const street = String(customer.address || '').trim();
+      const cityStateZip = getAddressCityStateZipForBill(customer);
+      return [street, cityStateZip].filter(Boolean).join(', ');
+    }
+
+    /**
      * Current-cycle amount still owed, reconciling aggregate currentMonthPaid with per-category buckets.
      * When they match (normal POS / saved data), use before-payment minus aggregate.
      * When they disagree (e.g. deposit applied only to aggregate), use sewer/tax/late remainings so Total Due matches the breakdown lines.
@@ -3154,8 +3175,8 @@
       return currentDue + pastDue - credit;
     }
 
-    // Days late for UI + 30/60/90 search: calendar days *after* the 20-day grace from last bill print.
-    // Example: 25 days since print → 5 days late. During grace, returns 0 (not yet "late" for this count).
+    // Days late for UI + 30/60/90 search: calendar days *after* the 20-day grace from lateFeeAnchorPrintDate (or last bill if no anchor).
+    // Example: 25 days since anchor print → 5 days late. During grace, returns 0 (not yet "late" for this count).
     // Same basis as late fees: getCalendarDaysLateAfterGrace(customer, 20).
     function getCustomerDaysLate(customer) {
       if (!customer) return 0;
@@ -3173,6 +3194,7 @@
       console.log('[LateLogic] getCustomerDaysLate:', {
         customerId: customer.id,
         accountNumber: customer.accountNumber,
+        lateFeeAnchorPrintDate: customer.lateFeeAnchorPrintDate,
         lastBillPrintDate: customer.lastBillPrintDate,
         daysSincePrint: dsp,
         calendarDaysLateAfterGrace: calLateForFee,
@@ -3185,7 +3207,7 @@
 
     // Marker to confirm the latest late-logic is loaded in the browser.
     // If you don't see this in console after a hard refresh, you're on a cached build.
-    console.log('[LateLogic] loaded: calendar-day diff v2 (current bill + pastDue)');
+    console.log('[LateLogic] loaded: v3 (late-fee anchor + fee TRACE logs; set window.LATE_FEE_TRACE_ALL=true for all calls)');
 
     // Format a Date as MM/DD/YYYY using local date components.
     function formatDateMMDDYYYY(dateObj) {
@@ -3306,13 +3328,19 @@
       }
       if (ps === 'overdue') {
         const dl = typeof getCustomerDaysLate === 'function' ? getCustomerDaysLate(customer) : 0;
-        return dl > 0 ? `Overdue (${dl} days)` : 'Overdue';
+        if (autoApplyLateFees && dl > 0) return `Overdue (${dl} days)`;
+        if (!autoApplyLateFees && dl > 0) return 'Overdue (past grace — auto late fees off)';
+        return 'Overdue';
       }
       if (ps === 'late') {
         if (!customer.lastBillPrintDate) return 'Late';
         const calLate = getCalendarDaysLateAfterGrace(customer, 20);
         const dsp = getDaysSinceLastBillPrint(customer);
-        if (calLate > 0) return `Late (${calLate} days)`;
+        if (calLate > 0) {
+          return autoApplyLateFees
+            ? `Late (${calLate} days)`
+            : `Late (${calLate} days past grace — fees toggle off)`;
+        }
         if (dsp !== null && dsp > 0) return `Late (${dsp} days)`;
         return 'Late';
       }
@@ -4070,30 +4098,96 @@
       }
     }
 
+    /**
+     * Verbose trace for late-fee debugging. Logs when past grace or when fee amount is $0 but calendars suggest otherwise.
+     * Set window.LATE_FEE_TRACE_ALL = true to log every call (noisy).
+     */
+    function traceAutomaticLateFeeAmount(customer, payload) {
+      try {
+        const id = customer && (customer.accountNumber || customer.id);
+        const calLate = customer ? getCalendarDaysLateAfterGrace(customer, 20) : 0;
+        const all = typeof window !== 'undefined' && window.LATE_FEE_TRACE_ALL;
+        const skipQuiet = !all && calLate <= 0 && payload.reason === 'not_past_grace';
+        if (skipQuiet) return;
+        console.log('[LateLogic] getAutomaticLateFeeAmount TRACE', {
+          accountNumber: id,
+          ...payload,
+          autoApplyLateFees,
+          lateFeeMode,
+          lateFeeFlat,
+          lateFeePercent
+        });
+      } catch (e) { /* ignore */ }
+    }
+
     // Helper to calculate automatic late fee amount based on days late and toggle
     function getAutomaticLateFeeAmount(customer) {
-      if (!customer) return 0;
+      if (!customer) {
+        traceAutomaticLateFeeAmount(customer, { reason: 'no_customer', fee: 0 });
+        return 0;
+      }
 
-      // Respect global toggle - when OFF, we still track status but don't auto-apply fees
-      if (!autoApplyLateFees) return 0;
+      const calLate = getCalendarDaysLateAfterGrace(customer, 20);
+      const anchorIso = getLateFeeTrackingPrintDateIso(customer);
+      const dsp = getDaysSinceLastBillPrint(customer);
+
+      // Respect global toggle - when OFF, calendar "days late" may still show in UI but fees stay $0
+      if (!autoApplyLateFees) {
+        const totalOwedIf = calLate > 0 ? getTotalOwedForLateTracking(customer, calLate) : null;
+        traceAutomaticLateFeeAmount(customer, {
+          reason: 'autoApplyLateFees_disabled',
+          fee: 0,
+          hint: 'Enable Settings → Toggles → Auto apply late fees (Firestore: settings/toggles.autoApplyLateFees)',
+          calLate,
+          daysSinceAnchorOrLastPrint: dsp,
+          lateFeeAnchorPrintDate: customer.lateFeeAnchorPrintDate,
+          lastBillPrintDate: customer.lastBillPrintDate,
+          totalOwedForLatePath: totalOwedIf,
+          lateFeeBase: getLateFeeBaseAmountBeforeFees(customer),
+          cyclesIfToggleOn: calLate > 0 ? (1 + Math.max(0, Math.floor((calLate - 1) / 30))) : 0
+        });
+        return 0;
+      }
 
       // Fee tiers are based on days *past the grace period*, not days since print
-      const calLate = getCalendarDaysLateAfterGrace(customer, 20);
-      if (calLate <= 0) return 0;
+      if (calLate <= 0) {
+        traceAutomaticLateFeeAmount(customer, {
+          reason: 'not_past_grace',
+          fee: 0,
+          calLate,
+          daysSinceAnchorOrLastPrint: dsp,
+          anchorIso
+        });
+        return 0;
+      }
 
       const totalOwed = getTotalOwedForLateTracking(customer, calLate);
-      if (totalOwed <= 0.005) return 0;
+      if (totalOwed <= 0.005) {
+        traceAutomaticLateFeeAmount(customer, {
+          reason: 'nothing_owed_for_late_path',
+          fee: 0,
+          calLate,
+          totalOwed,
+          pastDueRaw: customer.pastDue,
+          currentMonthPaid: customer.currentMonthPaid,
+          lateFeeAnchorPrintDate: customer.lateFeeAnchorPrintDate,
+          lastBillPrintDate: customer.lastBillPrintDate
+        });
+        return 0;
+      }
 
+      const base = getLateFeeBaseAmountBeforeFees(customer);
+      const cycles = getLateFeeCycleCount(calLate);
       const fee = getLateFeeAmountForCustomerAndDaysLate(customer, calLate);
 
-      console.log('[LateLogic] getAutomaticLateFeeAmount:', {
-        customerId: customer.id,
-        accountNumber: customer.accountNumber,
-        calendarDaysLateAfterGrace: calLate,
-        lateFeeMode,
-        lateFeeFlat,
-        lateFeePercent,
-        totalLateFee: fee
+      traceAutomaticLateFeeAmount(customer, {
+        reason: fee > 0 ? 'ok' : 'computed_fee_zero',
+        fee,
+        calLate,
+        totalOwed,
+        baseBeforeFees: base,
+        cycles,
+        daysSinceAnchorOrLastPrint: dsp
       });
 
       return fee;
@@ -4110,7 +4204,7 @@
       const totalOwedForFees = getTotalOwedForLateTracking(customer, calLate);
       if (totalOwedForFees <= 0.005) return;
 
-      const billKey = customer.lastBillPrintDate;
+      const billKey = customer.lateFeeAnchorPrintDate || customer.lastBillPrintDate;
       const now = window.getCurrentDate ? window.getCurrentDate() : new Date();
       const formattedDate = (now.getMonth() + 1).toString().padStart(2, '0') + '/' +
         now.getDate().toString().padStart(2, '0') + '/' + now.getFullYear();
@@ -4221,6 +4315,10 @@
 
       const total = currentDue + pastDue - credit;
 
+      if (customer.lateFeeAnchorPrintDate && total <= 0.005) {
+        delete customer.lateFeeAnchorPrintDate;
+      }
+
       return {
         baseServiceCost,
         adjustedServiceCost,
@@ -4303,9 +4401,20 @@
         currentDue: currentDueOnBill
       });
 
+      const openingPastDueForAnchor = parseFloat(customer.pastDue || 0);
+      const previousLastBillPrintDate = customer.lastBillPrintDate;
+
       applyBillProductionRollForward(customer, calcBeforeRoll);
       if (options.setBillDates !== false) {
-        customer.lastBillPrintDate = now.toISOString();
+        const printIso = now.toISOString();
+        if (!customer.lateFeeAnchorPrintDate) {
+          if (openingPastDueForAnchor > 0.005 && previousLastBillPrintDate) {
+            customer.lateFeeAnchorPrintDate = previousLastBillPrintDate;
+          } else {
+            customer.lateFeeAnchorPrintDate = printIso;
+          }
+        }
+        customer.lastBillPrintDate = printIso;
         customer.lastBill60DayDepositApplied = false;
       }
     }
@@ -4904,6 +5013,8 @@
           accountNumber: customer.accountNumber,
           pastDue: customer.pastDue,
           deposit: customer.deposit,
+          autoApplyLateFees,
+          lateFeeAnchorPrintDate: customer.lateFeeAnchorPrintDate,
           lastBillPrintDate: customer.lastBillPrintDate,
           lastBill60DayDepositApplied: customer.lastBill60DayDepositApplied
         });
@@ -4946,6 +5057,7 @@
         // Create FormData with all the required fields
         const formData = new FormData();
         const addressCityStateZip = getAddressCityStateZipForBill(customer);
+        const fullAddressForPdf = getFullAddressForBill(customer);
 
         const daysInCycle = lastDayOfMonth.getDate();
 
@@ -4953,6 +5065,7 @@
         formData.append('account_name', customer.name || '');
         formData.append('account_address', customer.address || '');
         formData.append('address_city_state_zip', addressCityStateZip);
+        formData.append('full_address', fullAddressForPdf);
         formData.append('statement_date', statementDate);
         formData.append('cycle_period', cyclePeriod);
         formData.append('days_in_cycle', String(daysInCycle));
@@ -4990,19 +5103,29 @@
         formData.append('total_amount', `$${pdfTotalAmount.toFixed(2)}`);
         formData.append('due_date', dueDateStr);
 
-        // Bill status text for PDF ("Status: Current" or "Status: X days late")
-        // Uses the same days-late logic as the rest of the app.
+        // Bill status text for PDF — align with late-fee toggle (fees $0 when autoApplyLateFees is off)
+        const calLatePdf = getCalendarDaysLateAfterGrace(customer, 20);
         const daysLateForBill = getCustomerDaysLate(customer);
+        const totalOwPdf = getTotalOwedForLateTracking(customer, calLatePdf);
         let statusText = 'Status: Current';
-        if (daysLateForBill > 0) {
+        if (autoApplyLateFees && daysLateForBill > 0) {
           statusText = `Status: ${daysLateForBill} days late`;
+        } else if (!autoApplyLateFees && calLatePdf > 0 && totalOwPdf > 0.005) {
+          statusText = `Status: ${calLatePdf} days past due (auto late fees off)`;
+        } else if (!autoApplyLateFees && parseFloat(customer.pastDue || 0) > 0.005) {
+          statusText = 'Status: Past-due balance (auto late fees off)';
+        } else if (parseFloat(customer.pastDue || 0) > 0.005 && calLatePdf <= 0) {
+          statusText = 'Status: Past-due balance';
         }
         formData.append('status', statusText);
 
         console.log('[LateLogic] produceBill status for PDF:', {
           customerId: customer.id,
           accountNumber: customer.accountNumber,
+          autoApplyLateFees,
+          calLatePdf,
           daysLateForBill,
+          totalOwPdf,
           statusText
         });
 
@@ -5281,6 +5404,7 @@
                 account_name: customer.name || '',
                 account_address: customer.address || '',
                 address_city_state_zip: getAddressCityStateZipForBill(customer),
+                full_address: getFullAddressForBill(customer),
                 statement_date: statementDate,
                 cycle_period: cyclePeriod,
                 days_in_cycle: lastDayOfMonth.getDate(),
@@ -5301,6 +5425,7 @@
             formData.append('account_name', customerSnapshot.pdfData.account_name);
             formData.append('account_address', customerSnapshot.pdfData.account_address);
             formData.append('address_city_state_zip', customerSnapshot.pdfData.address_city_state_zip || '');
+            formData.append('full_address', customerSnapshot.pdfData.full_address || '');
             formData.append('statement_date', customerSnapshot.pdfData.statement_date);
             formData.append('cycle_period', customerSnapshot.pdfData.cycle_period);
             formData.append('days_in_cycle', String(customerSnapshot.pdfData.days_in_cycle || ''));
@@ -5313,10 +5438,18 @@
             formData.append('total_amount', customerSnapshot.pdfData.total_amount);
             formData.append('due_date', customerSnapshot.pdfData.due_date);
 
+            const calLateBatch = getCalendarDaysLateAfterGrace(customer, 20);
             const daysLateForBill = getCustomerDaysLate(customer);
+            const totalOwBatch = getTotalOwedForLateTracking(customer, calLateBatch);
             let statusText = 'Status: Current';
-            if (daysLateForBill > 0) {
+            if (autoApplyLateFees && daysLateForBill > 0) {
               statusText = `Status: ${daysLateForBill} days late`;
+            } else if (!autoApplyLateFees && calLateBatch > 0 && totalOwBatch > 0.005) {
+              statusText = `Status: ${calLateBatch} days past due (auto late fees off)`;
+            } else if (!autoApplyLateFees && parseFloat(customer.pastDue || 0) > 0.005) {
+              statusText = 'Status: Past-due balance (auto late fees off)';
+            } else if (parseFloat(customer.pastDue || 0) > 0.005 && calLateBatch <= 0) {
+              statusText = 'Status: Past-due balance';
             }
             formData.append('status', statusText);
 
@@ -5584,6 +5717,13 @@
             Object.keys(customerSnapshot.pdfData).forEach(key => {
               formData.append(key, customerSnapshot.pdfData[key]);
             });
+            const pdfData = customerSnapshot.pdfData;
+            const hasFullAddr =
+              Object.prototype.hasOwnProperty.call(pdfData, 'full_address') &&
+              String(pdfData.full_address || '').trim().length > 0;
+            if (!hasFullAddr && customerSnapshot.customerData) {
+              formData.append('full_address', getFullAddressForBill(customerSnapshot.customerData));
+            }
 
             // Generate PDF
             const response = await fetch('/edit_pdf?pdf=bill', {
@@ -17566,6 +17706,7 @@
           customer.currentMonthPaidLateFee = 0;
           customer.currentMonthPaymentHistory = [];
           delete customer.lastBillPrintDate;
+          delete customer.lateFeeAnchorPrintDate;
           delete customer.lastPrintedStatementTotalDue;
           customer.lastBill60DayDepositApplied = false;
           delete customer.daysLate;
