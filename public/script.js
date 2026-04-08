@@ -4177,17 +4177,7 @@ import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.7.1/firebas
         // Get the PDF blob
         const blob = await response.blob();
 
-        // Create blob URL for download
-        const downloadUrl = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = downloadUrl;
-        a.download = 'bill.pdf';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(downloadUrl);
-
-        // Display the PDF below the button
+        // Display the PDF below the button (no automatic download)
         const displayUrl = URL.createObjectURL(blob);
         const pdfDisplay = document.getElementById('billPdfDisplay');
         const pdfViewer = document.getElementById('billPdfViewer');

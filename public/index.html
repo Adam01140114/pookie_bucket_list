@@ -4335,6 +4335,24 @@
     }
 
     /**
+     * True when currentMonthPaid only zeros out calc.currentDue because of Fresh start's synthetic
+     * testFreshStart payment (not real money). Produce Bill must still roll gross cycle charges.
+     */
+    function currentCycleReductionIsOnlyTestFreshStartPhantom(customer, grossCurrentOwed, netCurrentDue) {
+      const impliedPaid = Math.round((grossCurrentOwed - netCurrentDue) * 100) / 100;
+      if (impliedPaid <= 0.005) return false;
+      const hist = customer.paymentHistory || [];
+      if (!hist.some(p => p && p.source === 'testFreshStart')) return false;
+      const nonTestPaidTotal = hist
+        .filter(p => p && p.source !== 'testFreshStart')
+        .reduce((s, p) => s + (parseFloat(p.amountPaid) || 0), 0);
+      if (nonTestPaidTotal > 0.02) return false;
+      const aggPaid = parseFloat(customer.currentMonthPaid || 0);
+      if (Math.abs(aggPaid - impliedPaid) > 0.05) return false;
+      return true;
+    }
+
+    /**
      * After a successful bill PDF: unpaid current-cycle balance (after payments) rolls into pastDue,
      * and current-month payment buckets reset — next view shows prior balance + a new period's charges.
      * @param {object} customer - mutated in place
@@ -4342,13 +4360,33 @@
      */
     function applyBillProductionRollForward(customer, calc) {
       if (!customer || !calc) return;
-      // Total that was due on the bill just printed (for Amount Breakdown "Last Amount Due" when no payment row yet)
-      const statementTotal = Math.max(0, parseFloat(calc.total) || 0);
+      const prevPastDueRaw = parseFloat(customer.pastDue || 0);
+      const prevPastDuePositive = Math.max(0, prevPastDueRaw);
+      const credit = Math.abs(Math.min(0, prevPastDueRaw));
+
+      const grossCurrentOwed = Math.round(
+        (calc.subtotalBeforePuc + calc.pucSurchargeAmount + calc.lateFeeAmount) * 100
+      ) / 100;
+      let unpaidCurrent = Math.max(0, parseFloat(calc.currentDue) || 0);
+
+      if (
+        unpaidCurrent + 0.005 < grossCurrentOwed &&
+        currentCycleReductionIsOnlyTestFreshStartPhantom(customer, grossCurrentOwed, unpaidCurrent)
+      ) {
+        unpaidCurrent = grossCurrentOwed;
+      }
+
+      let statementTotal = Math.max(0, parseFloat(calc.total) || 0);
+      const correctedStatementTotal = Math.max(
+        0,
+        Math.round((unpaidCurrent + prevPastDuePositive - credit) * 100) / 100
+      );
+      if (correctedStatementTotal > statementTotal + 0.005) {
+        statementTotal = correctedStatementTotal;
+      }
       customer.lastPrintedStatementTotalDue = Math.round(statementTotal * 100) / 100;
 
-      const unpaidCurrent = Math.max(0, parseFloat(calc.currentDue) || 0);
-      const prevPastDue = parseFloat(customer.pastDue || 0);
-      customer.pastDue = Math.round((prevPastDue + unpaidCurrent) * 100) / 100;
+      customer.pastDue = Math.round((prevPastDueRaw + unpaidCurrent) * 100) / 100;
 
       customer.currentMonthPaid = 0;
       customer.currentMonthPaidSewer = 0;
@@ -4362,6 +4400,7 @@
       console.log('[BillingRoll] applyBillProductionRollForward:', {
         customerId: customer.id,
         accountNumber: customer.accountNumber,
+        grossCurrentOwed,
         unpaidCurrentRolledIntoPastDue: unpaidCurrent,
         newPastDue: customer.pastDue
       });
@@ -5158,17 +5197,7 @@
         // Get the PDF blob
         const blob = await response.blob();
 
-        // Create blob URL for download
-        const downloadUrl = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = downloadUrl;
-        a.download = 'bill.pdf';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(downloadUrl);
-
-        // Display the PDF below the button
+        // Display the PDF below the button (no automatic download)
         const displayUrl = URL.createObjectURL(blob);
         const pdfDisplay = document.getElementById('billPdfDisplay');
         const pdfViewer = document.getElementById('billPdfViewer');
