@@ -3974,7 +3974,7 @@ import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.7.1/firebas
           <div id="customerBillInfo" class="hidden bg-slate-50 dark:bg-slate-700 p-4 rounded-xl">
             <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
               <div>
-                <p class="text-sm text-slate-600 dark:text-slate-400">Current Amount Due</p>
+                <p class="text-sm text-slate-600 dark:text-slate-400">Total Amount Due</p>
                 <p id="billAmountDue" class="text-lg font-semibold text-slate-800 dark:text-slate-200">$0.00</p>
                 <button id="viewBillDetailsBtn" onclick="showBillDetailsModal()" class="text-blue-600 hover:text-blue-900 dark:text-blue-400 dark:hover:text-blue-300 text-xs mt-1">
                   View Details
@@ -4778,7 +4778,7 @@ import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.7.1/firebas
           <div id="customerBillInfo" class="hidden bg-slate-50 dark:bg-slate-700 p-4 rounded-xl">
             <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
               <div>
-                <p class="text-sm text-slate-600 dark:text-slate-400">Current Amount Due</p>
+                <p class="text-sm text-slate-600 dark:text-slate-400">Total Amount Due</p>
                 <p id="billAmountDue" class="text-lg font-semibold text-slate-800 dark:text-slate-200">$0.00</p>
                 <button id="viewBillDetailsBtn" onclick="showBillDetailsModal()" class="text-blue-600 hover:text-blue-900 dark:text-blue-400 dark:hover:text-blue-300 text-xs mt-1">
                   View Details
@@ -5562,7 +5562,7 @@ import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.7.1/firebas
           <div id="customerPaymentInfo" class="hidden bg-slate-50 dark:bg-slate-700 p-4 rounded-xl">
             <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
               <div>
-                <p class="text-sm text-slate-600 dark:text-slate-400">Current Amount Due</p>
+                <p class="text-sm text-slate-600 dark:text-slate-400">Total Amount Due</p>
                 <p id="paymentAmountDue" class="text-lg font-semibold text-slate-800 dark:text-slate-200">$0.00</p>
                 <button id="viewDetailsBtn" onclick="showPaymentDetailsModal()" class="text-blue-600 hover:text-blue-900 dark:text-blue-400 dark:hover:text-blue-300 text-xs mt-1">
                   View Details

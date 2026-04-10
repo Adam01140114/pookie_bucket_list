@@ -4565,8 +4565,58 @@
     }
 
     /**
-     * After a successful bill PDF: unpaid current-cycle balance (after payments) rolls into pastDue,
-     * and current-month payment buckets reset — next view shows prior balance + a new period's charges.
+     * Sum of real payments recorded after the last bill print (used to open the next statement balance).
+     */
+    function getPaymentsTotalSinceLastBillPrint(customer) {
+      const iso = customer && customer.lastBillPrintDate;
+      if (!iso || !Array.isArray(customer.paymentHistory)) return 0;
+      const anchor = new Date(iso).getTime();
+      if (isNaN(anchor)) return 0;
+      let sum = 0;
+      for (const p of customer.paymentHistory) {
+        if (!p) continue;
+        if (p.source === 'testFreshStart') continue;
+        const pt = p.timestamp ? new Date(p.timestamp).getTime() : NaN;
+        if (!isNaN(pt) && pt > anchor) {
+          sum += parseFloat(p.amountPaid) || 0;
+        }
+      }
+      return Math.round(sum * 100) / 100;
+    }
+
+    /**
+     * At the start of producing a bill: set opening past due from the last printed statement total
+     * minus payments since that print. Past due is not rolled from "current" at bill close — only here.
+     */
+    function applyPastDueOpeningForNextBillStatement(customer) {
+      if (!customer || !customer.lastBillPrintDate) return;
+      const lastRaw = customer.lastPrintedStatementTotalDue;
+      if (lastRaw === undefined || lastRaw === null || lastRaw === '') return;
+      const lastTotal = parseFloat(lastRaw);
+      if (isNaN(lastTotal)) return;
+      const paid = getPaymentsTotalSinceLastBillPrint(customer);
+      customer.pastDue = Math.round(Math.max(0, lastTotal - paid) * 100) / 100;
+    }
+
+    /**
+     * Process Bill customer info (above Produce Bill) — frozen to last produced PDF until the next bill.
+     */
+    function assignProcessBillCustomerInfoSnapshot(customer, snap) {
+      if (!customer || !snap) return;
+      customer.billCustomerInfoSnapshot = {
+        totalAmount: snap.totalAmount,
+        pastDue: snap.pastDue,
+        lateFee: snap.lateFee,
+        currentPeriodDue: snap.currentPeriodDue,
+        dueDate: snap.dueDate,
+        statusBadgeClass: snap.statusBadgeClass,
+        statusLabel: snap.statusLabel
+      };
+    }
+
+    /**
+     * After a successful bill PDF: current-month payment buckets reset for the new cycle.
+     * Opening past due for the *next* bill is applied in applyPastDueOpeningForNextBillStatement (not here).
      * @param {object} customer - mutated in place
      * @param {object} calc - result of calculateCustomerTotal(customer) for the bill that was just printed
      */
@@ -4598,8 +4648,6 @@
       }
       customer.lastPrintedStatementTotalDue = Math.round(statementTotal * 100) / 100;
 
-      customer.pastDue = Math.round((prevPastDueRaw + unpaidCurrent) * 100) / 100;
-
       customer.currentMonthPaid = 0;
       customer.currentMonthPaidSewer = 0;
       customer.currentMonthPaidTaxCodes = 0;
@@ -4613,8 +4661,9 @@
         customerId: customer.id,
         accountNumber: customer.accountNumber,
         grossCurrentOwed,
-        unpaidCurrentRolledIntoPastDue: unpaidCurrent,
-        newPastDue: customer.pastDue
+        unpaidCurrentForStatement: unpaidCurrent,
+        lastPrintedStatementTotalDue: customer.lastPrintedStatementTotalDue,
+        openingPastDueAfterClose: customer.pastDue
       });
     }
 
@@ -5121,35 +5170,58 @@
     function showCustomerBillInfo(customerId) {
       const customer = customers.find(c => c.id === customerId);
       if (customer) {
-        // Single source of truth with Amount Breakdown modal, payments, and PDF (see calculateCustomerTotal)
-        const calc = calculateCustomerTotal(customer);
-        const totalAmount = Math.max(0, calc.total);
-        const lateFeeAmount = calc.lateFeeAmount;
+        const snap = customer.billCustomerInfoSnapshot;
+        const useSnapshot = !!(
+          customer.lastBillPrintDate &&
+          snap &&
+          snap.totalAmount !== undefined &&
+          snap.totalAmount !== null &&
+          !Number.isNaN(Number(snap.totalAmount))
+        );
+
+        let totalAmount;
+        let lateFeeAmount;
+        let pastDueDisplay;
+        let dueDateStr;
+        let statusClass;
+        let statusLabel;
+
+        if (useSnapshot) {
+          totalAmount = Math.max(0, snap.totalAmount);
+          lateFeeAmount = Math.max(0, snap.lateFee);
+          pastDueDisplay = snap.pastDue;
+          dueDateStr = snap.dueDate || getBillDueDateStr(customer, 20);
+          statusClass = snap.statusBadgeClass || getPaymentStatusBadgeClass(customer);
+          statusLabel = snap.statusLabel || getPaymentStatusBadgeLabel(customer);
+        } else {
+          const calc = calculateCustomerTotal(customer);
+          totalAmount = Math.max(0, calc.total);
+          lateFeeAmount = calc.lateFeeAmount;
+          pastDueDisplay = parseFloat(customer.pastDue || 0);
+          dueDateStr = getBillDueDateStr(customer, 20);
+          statusClass = getPaymentStatusBadgeClass(customer);
+          statusLabel = getPaymentStatusBadgeLabel(customer);
+        }
 
         console.log('[LateLogic] showCustomerBillInfo:', {
           customerId: customer.id,
           accountNumber: customer.accountNumber,
+          useSnapshot,
           totalAmount,
           lateFeeAmount,
-          subtotalBeforePuc: calc.subtotalBeforePuc,
-          pucSurchargeAmount: calc.pucSurchargeAmount,
-          pastDue: calc.pastDue
+          pastDue: pastDueDisplay
         });
 
-        const dueDateStr = getBillDueDateStr(customer, 20);
-
         // Set up status indicator
-        const statusClass = getPaymentStatusBadgeClass(customer);
-
         document.getElementById('billAmountDue').textContent = `$${totalAmount.toFixed(2)}`;
-        document.getElementById('billPastDue').textContent = `$${parseFloat(customer.pastDue || 0).toFixed(2)}`;
+        document.getElementById('billPastDue').textContent = `$${parseFloat(pastDueDisplay || 0).toFixed(2)}`;
         document.getElementById('billDueDate').textContent = dueDateStr;
         document.getElementById('billLateFee').textContent = `$${lateFeeAmount.toFixed(2)}`;
 
         // Update status indicator
         const statusIndicator = document.getElementById('billStatusIndicator');
         statusIndicator.className = `inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${statusClass}`;
-        statusIndicator.textContent = getPaymentStatusBadgeLabel(customer);
+        statusIndicator.textContent = statusLabel;
 
         // Update property location
         document.getElementById('billPropertyLocation').textContent = customer.address;
@@ -5227,7 +5299,7 @@
           <div id="customerBillInfo" class="hidden bg-slate-50 dark:bg-slate-700 p-4 rounded-xl">
             <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
               <div>
-                <p class="text-sm text-slate-600 dark:text-slate-400">Current Amount Due</p>
+                <p class="text-sm text-slate-600 dark:text-slate-400">Total Amount Due</p>
                 <p id="billAmountDue" class="text-lg font-semibold text-slate-800 dark:text-slate-200">$0.00</p>
                 <button id="viewBillDetailsBtn" onclick="showBillDetailsModal()" class="text-blue-600 hover:text-blue-900 dark:text-blue-400 dark:hover:text-blue-300 text-xs mt-1">
                   View Details
@@ -5295,6 +5367,8 @@
       }
 
       try {
+        applyPastDueOpeningForNextBillStatement(customer);
+
         console.log('[LateLogic] produceBill START for customer:', {
           customerId: customer.id,
           accountNumber: customer.accountNumber,
@@ -5517,12 +5591,22 @@
 
           pushBillingCycleClosedLedgerRow(customer, calc, { now });
 
+          assignProcessBillCustomerInfoSnapshot(customer, {
+            totalAmount: pdfTotalAmount,
+            pastDue: pdfPreviousCharges,
+            lateFee: pdfLateFee,
+            currentPeriodDue: pdfCurrentDue,
+            dueDate: dueDateStr,
+            statusBadgeClass: getPaymentStatusBadgeClass(customer),
+            statusLabel: getPaymentStatusBadgeLabel(customer)
+          });
+
           console.log('[LateLogic] produceBill AFTER PDF:', {
             customerId: customer.id,
             accountNumber: customer.accountNumber,
             savedLastBillPrintDate: customer.lastBillPrintDate,
             lastBill60DayDepositApplied: customer.lastBill60DayDepositApplied,
-            pastDueAfterRoll: customer.pastDue
+            pastDueAfterClose: customer.pastDue
           });
 
           if (typeof saveSingleCustomerToFirestore === 'function') {
@@ -5651,6 +5735,7 @@
 
         for (const customer of cycleCustomers) {
           try {
+            applyPastDueOpeningForNextBillStatement(customer);
             const calc = calculateCustomerTotal(customer);
             const factor = customer.factor ? parseFloat(customer.factor) : 1.0;
             const adjustedServiceCost = calc.adjustedServiceCost;
@@ -5787,6 +5872,17 @@
               now,
               paymentMethod: `Billing cycle closed (batch cycle ${cycleNumber})`
             });
+
+            assignProcessBillCustomerInfoSnapshot(customer, {
+              totalAmount: pdfTotalNum,
+              pastDue: pastDueOpening,
+              lateFee: lateFeeAmount,
+              currentPeriodDue: pdfCurrentDueNum,
+              dueDate: dueDateStr,
+              statusBadgeClass: getPaymentStatusBadgeClass(customer),
+              statusLabel: getPaymentStatusBadgeLabel(customer)
+            });
+
             if (typeof saveSingleCustomerToFirestore === 'function') {
               await saveSingleCustomerToFirestore(customer);
             }
@@ -6154,7 +6250,7 @@
           <div id="customerBillInfo" class="hidden bg-slate-50 dark:bg-slate-700 p-4 rounded-xl">
             <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
               <div>
-                <p class="text-sm text-slate-600 dark:text-slate-400">Current Amount Due</p>
+                <p class="text-sm text-slate-600 dark:text-slate-400">Total Amount Due</p>
                 <p id="billAmountDue" class="text-lg font-semibold text-slate-800 dark:text-slate-200">$0.00</p>
                 <button id="viewBillDetailsBtn" onclick="showBillDetailsModal()" class="text-blue-600 hover:text-blue-900 dark:text-blue-400 dark:hover:text-blue-300 text-xs mt-1">
                   View Details
@@ -6960,7 +7056,7 @@
           <div id="customerPaymentInfo" class="hidden bg-slate-50 dark:bg-slate-700 p-4 rounded-xl">
             <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
               <div>
-                <p class="text-sm text-slate-600 dark:text-slate-400">Current Amount Due</p>
+                <p class="text-sm text-slate-600 dark:text-slate-400">Total Amount Due</p>
                 <p id="paymentAmountDue" class="text-lg font-semibold text-slate-800 dark:text-slate-200">$0.00</p>
                 <button id="viewDetailsBtn" onclick="showPaymentDetailsModal()" class="text-blue-600 hover:text-blue-900 dark:text-blue-400 dark:hover:text-blue-300 text-xs mt-1">
                   View Details
@@ -18017,6 +18113,7 @@
           delete customer.lastBillPrintDate;
           delete customer.lateFeeAnchorPrintDate;
           delete customer.lastPrintedStatementTotalDue;
+          delete customer.billCustomerInfoSnapshot;
           customer.lastBill60DayDepositApplied = false;
           delete customer.daysLate;
           delete customer.pendingDepositBillExplanation;
@@ -21200,7 +21297,7 @@
             <div id="customerPaymentInfo" class="hidden bg-slate-50 dark:bg-slate-700 p-4 rounded-xl">
               <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
                 <div>
-                  <p class="text-sm text-slate-600 dark:text-slate-400">Current Amount Due</p>
+                  <p class="text-sm text-slate-600 dark:text-slate-400">Total Amount Due</p>
                   <p id="paymentAmountDue" class="text-lg font-semibold text-slate-800 dark:text-slate-200">$0.00</p>
                   <button id="viewDetailsBtn" onclick="showPaymentDetailsModal()" class="text-blue-600 hover:text-blue-900 dark:text-blue-400 dark:hover:text-blue-300 text-xs mt-1">
                     View Details
@@ -21296,7 +21393,7 @@
             <div id="customerBillInfo" class="hidden bg-slate-50 dark:bg-slate-700 p-4 rounded-xl">
               <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
                 <div>
-                  <p class="text-sm text-slate-600 dark:text-slate-400">Current Amount Due</p>
+                  <p class="text-sm text-slate-600 dark:text-slate-400">Total Amount Due</p>
                   <p id="billAmountDue" class="text-lg font-semibold text-slate-800 dark:text-slate-200">$0.00</p>
                   <button id="viewBillDetailsBtn" onclick="showBillDetailsModal()" class="text-blue-600 hover:text-blue-900 dark:text-blue-400 dark:hover:text-blue-300 text-xs mt-1">
                     View Details
@@ -22358,7 +22455,7 @@
 
             <div class="bg-blue-50 dark:bg-blue-900/20 p-4 rounded-xl border border-blue-200 dark:border-blue-700 mb-6">
               <p class="text-sm text-blue-600 dark:text-blue-300">
-                <strong>How it works:</strong> When a customer makes a partial payment, the payment will be applied in the order shown below. For example, if the order is "Late fees, Past due amount, Current amount due, Puc surcharge, Tax Codes", the payment will first go toward late fees, then past due, and so on.
+                <strong>How it works:</strong> When a customer makes a partial payment, the payment will be applied in the order shown below. For example, if the order is "Late fees, Past due amount, Total amount due, Puc surcharge, Tax Codes", the payment will first go toward late fees, then past due, and so on.
               </p>
             </div>
 
