@@ -3223,7 +3223,7 @@
     }
 
     /**
-     * Amount due (current bill + past due) before late fees — used as the base for percentage late fees.
+     * Amount due (current bill + past due) before late fees — total owed excluding late fees.
      */
     function getLateFeeBaseAmountBeforeFees(customer) {
       if (!customer) return 0;
@@ -3237,21 +3237,32 @@
     }
 
     /**
+     * Net past-due balance (rolled balance / credit from pastDue field only) — base for percentage late fees.
+     */
+    function getLateFeePercentBaseAmount(customer) {
+      if (!customer) return 0;
+      const pastDueRaw = parseFloat(customer.pastDue || 0);
+      const pastDue = Math.max(0, pastDueRaw);
+      const credit = Math.abs(Math.min(0, pastDueRaw));
+      return Math.max(0, pastDue - credit);
+    }
+
+    /**
      * Late fee $ for a customer given calendar days late (past grace).
-     * Flat: flatPerCycle × cycles. Percent: base × (percent/100) × cycles.
-     * Combination: max(flatPerCycle, base × percent/100) × cycles per cycle equivalently max(flat×c, pct×c).
+     * Flat: flatPerCycle × cycles. Percent: pastDueBase × (percent/100) × cycles.
+     * Combination: max(flatPerCycle, pastDueBase × percent/100) × cycles per cycle equivalently max(flat×c, pct×c).
      */
     function getLateFeeAmountForCustomerAndDaysLate(customer, calendarDaysLate) {
       const cycles = getLateFeeCycleCount(calendarDaysLate);
       if (cycles === 0) return 0;
-      const base = getLateFeeBaseAmountBeforeFees(customer);
+      const pctBase = getLateFeePercentBaseAmount(customer);
       if (lateFeeMode === 'percent') {
-        if (base <= 0) return 0;
-        return Math.round(base * (lateFeePercent / 100) * cycles * 100) / 100;
+        if (pctBase <= 0) return 0;
+        return Math.round(pctBase * (lateFeePercent / 100) * cycles * 100) / 100;
       }
       if (lateFeeMode === 'combination') {
         const flatPart = lateFeeFlat * cycles;
-        const pctPart = base > 0 ? base * (lateFeePercent / 100) * cycles : 0;
+        const pctPart = pctBase > 0 ? pctBase * (lateFeePercent / 100) * cycles : 0;
         return Math.round(Math.max(flatPart, pctPart) * 100) / 100;
       }
       return Math.round(lateFeeFlat * cycles * 100) / 100;
@@ -4335,6 +4346,7 @@
           lastBillPrintDate: customer.lastBillPrintDate,
           totalOwedForLatePath: totalOwedIf,
           lateFeeBase: getLateFeeBaseAmountBeforeFees(customer),
+          lateFeePercentBase: getLateFeePercentBaseAmount(customer),
           cyclesIfToggleOn: calLate > 0 ? (1 + Math.max(0, Math.floor((calLate - 1) / 30))) : 0
         });
         return 0;
@@ -4368,6 +4380,7 @@
       }
 
       const base = getLateFeeBaseAmountBeforeFees(customer);
+      const percentBase = getLateFeePercentBaseAmount(customer);
       const cycles = getLateFeeCycleCount(calLate);
       const fee = getLateFeeAmountForCustomerAndDaysLate(customer, calLate);
 
@@ -4377,6 +4390,7 @@
         calLate,
         totalOwed,
         baseBeforeFees: base,
+        lateFeePercentBase: percentBase,
         cycles,
         daysSinceAnchorOrLastPrint: dsp
       });
@@ -16498,10 +16512,10 @@
 
     function getLateFeeStatusSummary() {
       if (lateFeeMode === 'percent') {
-        return `Current value: ${lateFeePercent.toFixed(2)}% of amount due (before late fees)`;
+        return `Current value: ${lateFeePercent.toFixed(2)}% of past due only`;
       }
       if (lateFeeMode === 'combination') {
-        return `Current value: max($${lateFeeFlat.toFixed(2)} or ${lateFeePercent.toFixed(2)}% of balance) per late-fee cycle`;
+        return `Current value: max($${lateFeeFlat.toFixed(2)} or ${lateFeePercent.toFixed(2)}% of past due) per late-fee cycle`;
       }
       return `Current value: $${lateFeeFlat.toFixed(2)} per 30‑day late period`;
     }
@@ -19217,11 +19231,11 @@
                   `Security deposit auto-pay applies at ${DEPOSIT_AUTO_APPLY_DAYS_LATE}+ days late (after bill print + grace).`;
               } else if (lateFeeMode === 'percent') {
                 hint.textContent =
-                  `${feeCycles} late-fee cycle${feeCycles === 1 ? '' : 's'} (percent mode: % applies to balance before late fees). ` +
+                  `${feeCycles} late-fee cycle${feeCycles === 1 ? '' : 's'} (percent mode: % applies to past due only). ` +
                   `Security deposit auto-pay applies at ${DEPOSIT_AUTO_APPLY_DAYS_LATE}+ days late (after bill print + grace).`;
               } else {
                 hint.textContent =
-                  `${feeCycles} late-fee cycle${feeCycles === 1 ? '' : 's'} (combination: each cycle uses the greater of $${Number(lateFeeFlat).toFixed(2)} or ${Number(lateFeePercent).toFixed(2)}% of balance before late fees). ` +
+                  `${feeCycles} late-fee cycle${feeCycles === 1 ? '' : 's'} (combination: each cycle uses the greater of $${Number(lateFeeFlat).toFixed(2)} or ${Number(lateFeePercent).toFixed(2)}% of past due). ` +
                   `Security deposit auto-pay applies at ${DEPOSIT_AUTO_APPLY_DAYS_LATE}+ days late (after bill print + grace).`;
               }
               lateFeeDetailsEl.appendChild(hint);
@@ -21964,7 +21978,7 @@
               <div class="flex justify-between items-center mb-4">
                 <div>
                   <h4 class="text-lg font-semibold text-slate-800 dark:text-slate-200">Late Fee</h4>
-                  <p class="text-sm text-slate-500 dark:text-slate-400 mt-1">Flat per 30‑day late period (up to 3), percent of amount due before late fees, or combination (whichever is higher each cycle).</p>
+                  <p class="text-sm text-slate-500 dark:text-slate-400 mt-1">Flat per 30‑day late period (up to 3), percent of past due only, or combination (whichever is higher each cycle).</p>
                 </div>
               </div>
               <div class="flex flex-wrap items-center gap-4 mb-4">
@@ -21975,7 +21989,7 @@
                 </label>
                 <label class="inline-flex items-center gap-2 text-sm text-slate-700 dark:text-slate-300 cursor-pointer">
                   <input type="radio" name="lateFeeMode" id="lateFeeModePercent" value="percent" class="rounded-full border-slate-300" onchange="syncLateFeeModeLabels()" />
-                  Percent of amount due (%)
+                  Percent of past due (%)
                 </label>
                 <label class="inline-flex items-center gap-2 text-sm text-slate-700 dark:text-slate-300 cursor-pointer">
                   <input type="radio" name="lateFeeMode" id="lateFeeModeCombination" value="combination" class="rounded-full border-slate-300" onchange="syncLateFeeModeLabels()" />
@@ -21995,7 +22009,7 @@
                   />
                 </div>
                 <div id="lateFeePercentFieldWrap" class="flex-1">
-                  <label id="lateFeePercentLabel" class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">Percent of amount due (%)</label>
+                  <label id="lateFeePercentLabel" class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">Percent of past due (%)</label>
                   <input 
                     type="number" 
                     id="lateFeePercentInput" 
